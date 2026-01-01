@@ -21,41 +21,56 @@
     { code: '11', label: 'Vacant Land', color: '#E4E4E4' },
   ];
 
-  // --- DONUT CHART CALCULATIONS ---
+  // --- DONUT CHART CONSTANTS ---
   const R = 18;
-  const CIRCUMFERENCE = 2 * Math.PI * R;
+  const CIRCUMFERENCE = 2 * Math.PI * R; // ~113.097
 
   let donutSegments = [];
-  
+  let indicatorData = [];
+
   $: {
     let accumulatedPercent = 0;
     
-    // 1. Calculate raw stats
+    // 1. Calculate stats for ALL categories
     const rawSegments = CATEGORIES.map(cat => {
-      // Handle the "01" vs "1" key mismatch by checking both
       const categoryAcres = data.breakdown ? (data.breakdown[cat.code] || data.breakdown[parseInt(cat.code)] || 0) : 0;
       const pct = (data.area > 0) ? (categoryAcres / data.area) : 0;
       return { ...cat, pct, categoryAcres };
     });
 
-    // 2. Generate SVG commands
+    // 2. Main "Entropy" Donut (Stacked)
     donutSegments = rawSegments.map(seg => {
       const segmentLength = seg.pct * CIRCUMFERENCE;
       const rotation = (accumulatedPercent * 360) - 90;
       accumulatedPercent += seg.pct;
 
       return {
-        // --- CRITICAL FIX: Pass the ID and Label through! ---
         code: seg.code, 
         label: seg.label,
         color: seg.color,
-        // ----------------------------------------------------
         dashArray: `${segmentLength} ${CIRCUMFERENCE}`,
         rotation: rotation,
         displayPct: (seg.pct * 100).toFixed(1),
         displayAcres: seg.categoryAcres.toFixed(1)
       };
     });
+
+    // 3. NEW: "Key Indicators" Donuts (Standalone)
+    // We strictly filter for Parks (9) and Vacant (11)
+    const targetCodes = ['9', '11'];
+    
+    indicatorData = rawSegments
+      .filter(seg => targetCodes.includes(seg.code))
+      .map(seg => {
+        // Calculate a standalone stroke for this category starting at 12 o'clock
+        const segmentLength = seg.pct * CIRCUMFERENCE;
+        return {
+          label: seg.label,
+          color: seg.color,
+          displayPct: (seg.pct * 100).toFixed(1),
+          dashArray: `${segmentLength} ${CIRCUMFERENCE}`
+        };
+      });
   }
 </script>
 
@@ -128,6 +143,34 @@
       </div>
     {/each}
   </div>
+
+  <div class="indicators-section">
+    <h3>Key Indicators</h3>
+    <div class="indicator-grid">
+      {#each indicatorData as ind}
+        <div class="indicator-card">
+          <div class="donut-mini">
+            <svg width="60" height="60" viewBox="0 0 40 40">
+              <circle cx="20" cy="20" r={R} fill="none" stroke="#eee" stroke-width="4" />
+              <circle 
+                cx="20" cy="20" r={R} 
+                fill="none" 
+                stroke={ind.color} 
+                stroke-width="4"
+                stroke-dasharray={ind.dashArray}
+                transform="rotate(-90 20 20)" 
+              />
+              <text x="50%" y="55%" text-anchor="middle" font-size="8" font-weight="bold" fill="#333">
+                {ind.displayPct}%
+              </text>
+            </svg>
+          </div>
+          <span class="label">{ind.label}</span>
+        </div>
+      {/each}
+    </div>
+  </div>
+
 </div>
 
 <style>
@@ -149,7 +192,7 @@
 
   .value { font-size: 1.5rem; font-weight: 700; color: #111; line-height: 1.2; }
   .value.centered { font-size: 0.9rem; } 
-  .value small { font-size: 0.9rem; color: #666; font-weight: 400; }
+  .value small { font-size: 1rem; color: #666; font-weight: 400; }
   .label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin-top: 0.25rem; text-align: center;}
   
   h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin-bottom: 1rem; }
@@ -157,4 +200,10 @@
   .cat-info { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 0.25rem; }
   .progress-bar-bg { width: 100%; height: 6px; background: #f0f0f0; border-radius: 3px; overflow: hidden; }
   .progress-bar-fill { height: 100%; transition: width 0.3s ease; }
+
+  /* NEW STYLES FOR INDICATORS */
+  .indicators-section { margin-top: 3rem; padding-top: 2rem; border-top: 1px solid #eee; }
+  .indicator-grid { display: flex; gap: 2rem; justify-content: flex-start; }
+  .indicator-card { display: flex; flex-direction: column; align-items: center; width: 80px; text-align: center; }
+  .donut-mini { margin-bottom: 0.5rem; }
 </style>
