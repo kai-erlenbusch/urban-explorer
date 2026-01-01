@@ -1,8 +1,10 @@
 <script>
+  export let radius = 0.25; 
   export let data = {
     count: 0,
     area: 0,
-    breakdown: {}
+    breakdown: {},
+    entropy: 0
   };
 
   const CATEGORIES = [
@@ -19,46 +21,108 @@
     { code: '11', label: 'Vacant Land', color: '#E4E4E4' },
   ];
 
-  function getPercentage(code) {
-    if (data.count === 0) return 0;
-    const count = data.breakdown[code] || 0;
-    return (count / data.count) * 100;
+  // --- DONUT CHART CALCULATIONS ---
+  const R = 18;
+  const CIRCUMFERENCE = 2 * Math.PI * R;
+
+  let donutSegments = [];
+  
+  $: {
+    let accumulatedPercent = 0;
+    
+    // 1. Calculate raw stats
+    const rawSegments = CATEGORIES.map(cat => {
+      // Handle the "01" vs "1" key mismatch by checking both
+      const categoryAcres = data.breakdown ? (data.breakdown[cat.code] || data.breakdown[parseInt(cat.code)] || 0) : 0;
+      const pct = (data.area > 0) ? (categoryAcres / data.area) : 0;
+      return { ...cat, pct, categoryAcres };
+    });
+
+    // 2. Generate SVG commands
+    donutSegments = rawSegments.map(seg => {
+      const segmentLength = seg.pct * CIRCUMFERENCE;
+      const rotation = (accumulatedPercent * 360) - 90;
+      accumulatedPercent += seg.pct;
+
+      return {
+        // --- CRITICAL FIX: Pass the ID and Label through! ---
+        code: seg.code, 
+        label: seg.label,
+        color: seg.color,
+        // ----------------------------------------------------
+        dashArray: `${segmentLength} ${CIRCUMFERENCE}`,
+        rotation: rotation,
+        displayPct: (seg.pct * 100).toFixed(1),
+        displayAcres: seg.categoryAcres.toFixed(1)
+      };
+    });
   }
 </script>
 
 <div class="sidebar">
   <div class="header">
     <h1>Land Use</h1>
-    <p class="description">Land use data reveals the general distribution...</p>
+    <p class="description">Land use data reveals the general distribution of existing functions.</p>
+    
+    <div class="control-group">
+        <label for="radius">Pedshed Radius: <strong>{radius} mi</strong></label>
+        <input 
+            id="radius" 
+            type="range" 
+            min="0.1" 
+            max="1.0" 
+            step="0.05" 
+            bind:value={radius} 
+        />
+    </div>
   </div>
 
   <div class="metrics-grid">
     <div class="metric">
-      <span class="value">{data.count}</span>
+      <span class="value">{data.count.toLocaleString()}</span>
       <span class="label">Lots</span>
     </div>
     <div class="metric">
-      <span class="value">{data.area.toFixed(2)} <small>ac</small></span>
+      <span class="value">{data.area ? data.area.toFixed(1) : '0.0'} <small>ac</small></span>
       <span class="label">Lot Area</span>
     </div>
-    <div class="metric">
-      <span class="value">0.64</span>
+    
+    <div class="metric entropy-metric">
+      <div class="donut-wrapper">
+        <svg width="50" height="50" viewBox="0 0 40 40">
+          <circle cx="20" cy="20" r={R} fill="none" stroke="#eee" stroke-width="4" />
+          {#each donutSegments as seg}
+            <circle 
+              cx="20" cy="20" r={R} 
+              fill="none" 
+              stroke={seg.color} 
+              stroke-width="4"
+              stroke-dasharray={seg.dashArray}
+              transform="rotate({seg.rotation} 20 20)" 
+            />
+          {/each}
+        </svg>
+        <span class="value centered">{data.entropy ? data.entropy.toFixed(2) : '0.00'}</span>
+      </div>
       <span class="label">Entropy Score</span>
     </div>
   </div>
 
   <div class="category-list">
     <h3>Land Use Categories</h3>
-    {#each CATEGORIES as cat}
+    {#each donutSegments as cat (cat.code)} 
       <div class="category-row">
         <div class="cat-info">
           <span class="cat-name">{cat.label}</span>
-          <span class="cat-val">{getPercentage(cat.code).toFixed(1)}%</span>
+          <span class="cat-val">
+            {cat.displayPct}% <small style="color:#aaa;">({cat.displayAcres} ac)</small>
+          </span>
         </div>
         <div class="progress-bar-bg">
           <div 
             class="progress-bar-fill" 
-            style="width: {getPercentage(cat.code)}%; background-color: {cat.color};"
+            style:width="{cat.displayPct}%" 
+            style:background-color={cat.color}
           ></div>
         </div>
       </div>
@@ -67,17 +131,30 @@
 </div>
 
 <style>
+  .control-group { margin-bottom: 2rem; padding: 1rem; background: #f9f9f9; border-radius: 4px; }
+  label { display: block; font-size: 0.85rem; margin-bottom: 0.5rem; color: #555; }
+  input[type=range] { width: 100%; cursor: pointer; }
+
   .sidebar { padding: 2rem; font-family: 'Inter', sans-serif; color: #333; height: 100%; overflow-y: auto; box-sizing: border-box; }
   h1 { font-size: 1.5rem; margin-bottom: 0.5rem; font-weight: 700; }
   .description { font-size: 0.9rem; line-height: 1.5; color: #666; margin-bottom: 2rem; }
-  .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2.5rem; padding-bottom: 2rem; border-bottom: 1px solid #eee; }
-  .metric { display: flex; flex-direction: column; }
-  .value { font-size: 1.8rem; font-weight: 700; color: #111; }
-  .value small { font-size: 1rem; color: #666; font-weight: 400; }
-  .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin-top: 0.25rem; }
+  
+  .metrics-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-bottom: 2.5rem; padding-bottom: 2rem; border-bottom: 1px solid #eee; }
+  .metric { display: flex; flex-direction: column; justify-content: flex-start; }
+  
+  .entropy-metric { align-items: center; }
+  .donut-wrapper { position: relative; width: 50px; height: 50px; display: flex; justify-content: center; align-items: center; margin-bottom: 0.25rem; }
+  .donut-wrapper svg { position: absolute; top: 0; left: 0; }
+  circle { transition: all 0.3s ease; } 
+
+  .value { font-size: 1.5rem; font-weight: 700; color: #111; line-height: 1.2; }
+  .value.centered { font-size: 0.9rem; } 
+  .value small { font-size: 0.9rem; color: #666; font-weight: 400; }
+  .label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin-top: 0.25rem; text-align: center;}
+  
   h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; margin-bottom: 1rem; }
   .category-row { margin-bottom: 1rem; }
   .cat-info { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 0.25rem; }
   .progress-bar-bg { width: 100%; height: 6px; background: #f0f0f0; border-radius: 3px; overflow: hidden; }
-  .progress-bar-fill { height: 100%; transition: width 0.2s ease; }
+  .progress-bar-fill { height: 100%; transition: width 0.3s ease; }
 </style>

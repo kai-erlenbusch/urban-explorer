@@ -2,11 +2,16 @@
   import Map from './lib/Map.svelte';
   import Sidebar from './lib/Sidebar.svelte';
 
+  // FIX: Initialize entropy to 0 so it matches the expected type
   let analysisData = {
     count: 0,
     area: 0,
-    breakdown: {}
+    breakdown: {},
+    entropy: 0
   };
+
+  // Shared state: Radius starts at 0.25 miles
+  let radius = 0.25; 
 
   function handleAnalysis(event) {
     analysisData = event.detail;
@@ -15,10 +20,10 @@
 
 <main>
   <div class="sidebar-container">
-    <Sidebar data={analysisData} />
+    <Sidebar bind:radius={radius} data={analysisData} />
   </div>
   <div class="map-container">
-    <Map on:analysis={handleAnalysis} />
+    <Map {radius} on:analysis={handleAnalysis} />
   </div>
 </main>
 

@@ -1,8 +1,10 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import maplibregl from 'maplibre-gl';
   import * as turf from '@turf/turf';
   import 'maplibre-gl/dist/maplibre-gl.css';
+
+  const dispatch = createEventDispatcher();
 
   export let radius = 0.25;
 
@@ -19,7 +21,8 @@
     [-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]
   ]]);
 
-  $: if (map && map.getSource('mask-source') && currentLngLat) {
+  // Reactive Statement
+  $: if (map && map.getSource('mask-source') && currentLngLat && radius) {
     runSpatialEngine(currentLngLat);
   }
 
@@ -47,7 +50,7 @@
     map.on('load', () => {
       map.addSource('pluto-data', { type: 'vector', url: TILESET_ID });
 
-      // 1. COLORS: The "Universal Match"
+      // 1. COLORS
       map.addLayer({
         id: 'pluto-fill',
         type: 'fill',
@@ -56,7 +59,7 @@
         paint: {
           'fill-color': [
             'match',
-            ['to-string', ['get', 'LandUse']], // Force to text
+            ['to-string', ['get', 'LandUse']],
             '01', '#F9EDDB', '1', '#F9EDDB',
             '02', '#F6D9CB', '2', '#F6D9CB',
             '03', '#F6D9CB', '3', '#F6D9CB',
@@ -74,8 +77,7 @@
         }
       });
 
-      // 2. LINE LAYER (RESTORED FOOTPRINTS)
-      // This sits on top of the colors but below the white mask
+      // 2. LINES
       map.addLayer({
         id: 'pluto-lines',
         type: 'line',
@@ -83,14 +85,12 @@
         'source-layer': SOURCE_LAYER_NAME,
         paint: {
           'line-width': 0.5,
-          // Easing: Invisible at zoom 13.5, mostly visible at zoom 15.5
           'line-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 0, 15.5, 0.8],
-          // Color Shift: Light gray at zoom 14, Dark gray at zoom 16
           'line-color': ['interpolate', ['linear'], ['zoom'], 14, '#cccccc', 16, '#444444']
         }
       });
 
-      // 3. MASK (White Fog)
+      // 3. MASK
       map.addSource('mask-source', { type: 'geojson', data: WORLD_MASK });
       map.addLayer({
         id: 'mask-layer',
@@ -111,44 +111,63 @@
   function runSpatialEngine(center) {
     if (!map.getLayer('pluto-fill')) return;
 
-    // Visuals
     const circle = turf.circle(center, radius, { steps: 64, units: 'miles' });
     const maskGeometry = turf.difference(turf.featureCollection([WORLD_MASK, circle]));
     map.getSource('mask-source').setData(maskGeometry);
 
-    // Data Query
     const bbox = turf.bbox(circle);
     const southWest = map.project([bbox[0], bbox[1]]);
     const northEast = map.project([bbox[2], bbox[3]]);
-
+    
     const candidates = map.queryRenderedFeatures(
       [southWest, northEast], 
       { layers: ['pluto-fill'] }
     );
 
     const insideFeatures = candidates.filter(feature => {
-      const centroid = turf.centroid(feature);
-      return turf.booleanPointInPolygon(centroid, circle);
+      return turf.booleanIntersects(feature, circle);
     });
 
-    // --- ANALYTICS ---
+    // --- ANALYTICS ENGINE ---
     const breakdown = {};
+    let totalArea = 0;
+
     insideFeatures.forEach(feature => {
+      const featureAcres = (feature.properties.LotArea || turf.area(feature)) * 0.000247105;
+      totalArea += featureAcres;
+
       const rawLU = feature.properties.LandUse;
       if (rawLU) {
         const stringLU = String(rawLU);
-        // Normalize "01" -> "1"
         const cleanKey = parseInt(stringLU, 10).toString();
         
         if (cleanKey && cleanKey !== "NaN") {
-          breakdown[cleanKey] = (breakdown[cleanKey] || 0) + 1;
+          breakdown[cleanKey] = (breakdown[cleanKey] || 0) + featureAcres;
         }
       }
     });
 
-    console.log(`--- Pedshed Analysis ---`);
-    console.log(`Total Lots: ${insideFeatures.length}`);
-    console.log(`Breakdown:`, breakdown);
+    // --- ENTROPY CALCULATION (Shannon Index) ---
+    let entropy = 0;
+    if (totalArea > 0) {
+      let H = 0;
+      Object.values(breakdown).forEach(area => {
+        const p = area / totalArea; // Proportion of this category
+        if (p > 0) {
+          H -= p * Math.log(p); // -p * ln(p)
+        }
+      });
+      // Normalize (0 to 1) by dividing by ln(11 categories)
+      const maxEntropy = Math.log(11);
+      entropy = H / maxEntropy;
+    }
+
+    dispatch('analysis', {
+      count: insideFeatures.length,
+      area: totalArea,
+      breakdown: breakdown,
+      entropy: entropy // <--- Sending the Score!
+    });
   }
 
   onDestroy(() => {
