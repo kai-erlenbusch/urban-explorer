@@ -1,11 +1,11 @@
 <script>
-  import { onMount, onDestroy, createEventDispatcher } from 'svelte'; // Added createEventDispatcher
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { activeLayer, analysisData, demographicsData, radius } from './stores.js';
   import maplibregl from 'maplibre-gl';
   import * as turf from '@turf/turf';
   import 'maplibre-gl/dist/maplibre-gl.css';
 
-  const dispatch = createEventDispatcher(); // Initialize Dispatcher
+  const dispatch = createEventDispatcher();
 
   let map;
   let mapContainer;
@@ -19,13 +19,15 @@
   const LANDUSE_TILESET_ID = 'mapbox://kai-erlenbusch.9a769cf2';
   const LANDUSE_SOURCE_LAYER = 'mn_mappluto-d8n2zk';
 
-  const CENSUS_TILESET_ID = 'mapbox://kai-erlenbusch.cxab71ns';
-  const CENSUS_SOURCE_LAYER = 'census_dots-bf63fb';
+  // --- NEW FULL DATASET ---
+  const CENSUS_TILESET_ID = 'mapbox://kai-erlenbusch.0ua9vbjj';
+  const CENSUS_SOURCE_LAYER = 'census_dots_full'; // Internal name from Tippecanoe
 
   const WORLD_MASK = turf.polygon([[
     [-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]
   ]]);
 
+  // --- STORES ---
   const unsubscribeRadius = radius.subscribe(value => {
     currentRadius = value;
     if (map && cursorPosition) updateMapState(cursorPosition);
@@ -37,15 +39,18 @@
     
     const isLandUse = value === 'landuse';
 
+    // Toggle Layers
     if (map.getLayer('pluto-fill')) map.setLayoutProperty('pluto-fill', 'visibility', isLandUse ? 'visible' : 'none');
     if (map.getLayer('pluto-lines')) map.setLayoutProperty('pluto-lines', 'visibility', isLandUse ? 'visible' : 'none');
-    if (map.getLayer('mask-layer')) map.setLayoutProperty('mask-layer', 'visibility', isLandUse ? 'visible' : 'none');
     
     if (map.getLayer('census-dots')) map.setLayoutProperty('census-dots', 'visibility', isLandUse ? 'none' : 'visible');
 
-    if (cursorPosition) updateMapState(cursorPosition);
+    setTimeout(() => {
+        if (cursorPosition) updateMapState(cursorPosition);
+    }, 100);
   });
 
+  // --- ENGINE ---
   function updateMapState(lngLat) {
     if (!map) return;
     cursorPosition = lngLat;
@@ -53,18 +58,21 @@
     const centerPoint = turf.point([lngLat.lng, lngLat.lat]);
     const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 64, units: 'miles' });
 
+    // 1. Update Visual Mask
     if (map.getSource('mask-source')) {
         const maskGeometry = turf.difference(turf.featureCollection([WORLD_MASK, circleGeo]));
         map.getSource('mask-source').setData(maskGeometry);
     }
 
+    // 2. Run Analysis based on Active Tab
     if (currentMode === 'landuse') {
         analyzeLandUse(circleGeo);
     } else {
-        analyzeDemographics(circleGeo);
+        analyzeDemographics(centerPoint);
     }
   }
 
+  // --- LAND USE LOGIC (STABLE) ---
   function analyzeLandUse(circleGeo) {
     const bbox = turf.bbox(circleGeo);
     const southWest = map.project([bbox[0], bbox[1]]);
@@ -74,16 +82,26 @@
     
     let totalArea = 0;
     let counts = {};
-    
-    features.forEach(f => {
+    const seenIds = new Set();
+    const insideFeatures = [];
+
+    for (const feature of features) {
+        const uniqueId = feature.id || feature.properties.BBL || feature.properties.LotArea;
+        if (seenIds.has(uniqueId)) continue;
+
+        if (turf.booleanIntersects(feature, circleGeo)) {
+            seenIds.add(uniqueId);
+            insideFeatures.push(feature);
+        }
+    }
+
+    insideFeatures.forEach(f => {
        const rawLU = f.properties.LandUse; 
-       
-       // FORCE AREA CALCULATION (Since LotArea is missing in tiles)
-       const area = turf.area(f) * 0.000247105; 
+       const area = (f.properties.LotArea || turf.area(f)) * 0.000247105; 
        
        if (rawLU) {
             const cleanKey = parseInt(String(rawLU), 10).toString();
-            if (cleanKey !== "NaN") {
+            if (cleanKey && cleanKey !== "NaN") {
                 if (!counts[cleanKey]) counts[cleanKey] = 0;
                 counts[cleanKey] += area;
                 totalArea += area;
@@ -101,41 +119,69 @@
         entropy = H / Math.log(11); 
     }
 
-    const result = {
-        count: features.length,
+    analysisData.set({
+        count: insideFeatures.length,
         area: totalArea,
         breakdown: counts,
         entropy: entropy
-    };
-
-    // CRITICAL FIX: Dispatch event so App.svelte passes data to Sidebar
-    dispatch('analysis', result); 
-    
-    // Also update store for safety
-    analysisData.set(result);
+    });
   }
 
-  function analyzeDemographics(circleGeo) {
+  // --- DEMOGRAPHICS LOGIC (FULL DATA) ---
+  function analyzeDemographics(centerPoint) {
     const features = map.queryRenderedFeatures({ layers: ['census-dots'] });
+    
     let totalPeople = 0;
     let ethnicityCounts = {};
+    let femaleCount = 0; 
+    let ageCounts = { '0-4': 0, '5-17': 0, '18-34': 0, '35-59': 0, '60+': 0 };
+    
+    const radiusKm = currentRadius * 1.60934;
 
     features.forEach(f => {
         const pt = turf.point(f.geometry.coordinates);
-        if (turf.booleanPointInPolygon(pt, circleGeo)) {
-            const pop = f.properties.pop_est || 1; 
+        const distance = turf.distance(centerPoint, pt, {units: 'kilometers'});
+        
+        if (distance <= radiusKm) {
+            // 1. ETHNICITY
             const eth = f.properties.ethnicity || 'Other';
+            const pop = f.properties.pop_est || 1; 
             
             totalPeople += pop;
             if (!ethnicityCounts[eth]) ethnicityCounts[eth] = 0;
             ethnicityCounts[eth] += pop;
+
+            // 2. SEX (From new tileset)
+            // Python script saved it as 'sex' (Male/Female)
+            const sex = f.properties.sex;
+            if (sex === 'Female') femaleCount += pop;
+
+            // 3. AGE (From new tileset)
+            // Python script saved it as 'age_group'
+            const age = f.properties.age_group;
+            if (age && ageCounts[age] !== undefined) {
+                ageCounts[age] += pop;
+            }
         }
     });
+
+    // --- CALCULATE DIVERSITY INDEX ---
+    let sumSquares = 0;
+    if (totalPeople > 0) {
+        Object.values(ethnicityCounts).forEach(count => {
+            const p = count / totalPeople;
+            sumSquares += p * p;
+        });
+    }
+    const diversityIndex = totalPeople > 0 ? (1 - sumSquares) : 0;
 
     demographicsData.set({
         totalPeople: totalPeople,
         density: totalPeople / (Math.PI * currentRadius * currentRadius * 640), 
-        ethnicityBreakdown: ethnicityCounts
+        ethnicityBreakdown: ethnicityCounts,
+        diversityIndex: diversityIndex,
+        percentFemale: totalPeople > 0 ? (femaleCount / totalPeople) * 100 : 0,
+        ageBreakdown: ageCounts
     });
   }
 
@@ -145,6 +191,7 @@
       style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
       center: [-73.985, 40.748], 
       zoom: 13,
+      minZoom: 8, 
       transformRequest: (url) => {
         if (url.startsWith("mapbox://")) {
           return {
@@ -185,34 +232,38 @@
       });
 
       map.addLayer({
-        id: 'pluto-lines',
-        type: 'line',
-        source: 'pluto-data',
+        'id': 'pluto-lines',
+        'type': 'line',
+        'source': 'pluto-data',
         'source-layer': LANDUSE_SOURCE_LAYER,
-        paint: {
-          'line-width': 0.5,
-          'line-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 0, 15.5, 0.8],
-          'line-color': ['interpolate', ['linear'], ['zoom'], 14, '#cccccc', 16, '#444444']
+        'paint': {
+            'line-width': 0.5,
+            'line-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 0, 15.5, 0.8],
+            'line-color': '#cccccc'
         },
         'layout': { 'visibility': 'visible' }
       });
 
-      // 2. DEMOGRAPHICS
+      // 2. DEMOGRAPHICS (DOTS)
       map.addSource('census-source', { type: 'vector', url: CENSUS_TILESET_ID });
       map.addLayer({
         id: 'census-dots',
         type: 'circle',
         source: 'census-source', 
         'source-layer': CENSUS_SOURCE_LAYER,
+        minzoom: 8, 
         paint: {
-          'circle-radius': 2,
+          'circle-radius': {
+            'base': 1.5,
+            'stops': [[8, 1], [16, 4]]
+          },
           'circle-color': [
-              'match', ['get', 'ethnicity'],
-              'Asian', '#E55E5E',
-              'Black', '#3182CE',
-              'Hispanic', '#DD6B20',
-              'White', '#38A169',
-              '#718096'
+             'match', ['get', 'ethnicity'],
+             'Asian', '#eeae9f',
+             'Black', '#68c582',
+             'Hispanic', '#f0ba5e',
+             'White', '#4674ea',
+             '#b1b1b1' // Fallback / Other
           ],
           'circle-opacity': 0.8
         },
@@ -235,6 +286,7 @@
           updateMapState(e.lngLat);
       });
       
+      // Initialize
       updateMapState(map.getCenter());
     });
   });
