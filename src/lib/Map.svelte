@@ -1,38 +1,150 @@
 <script>
-  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte'; // Added createEventDispatcher
+  import { activeLayer, analysisData, demographicsData, radius } from './stores.js';
   import maplibregl from 'maplibre-gl';
   import * as turf from '@turf/turf';
   import 'maplibre-gl/dist/maplibre-gl.css';
 
-  const dispatch = createEventDispatcher();
+  const dispatch = createEventDispatcher(); // Initialize Dispatcher
 
-  export let radius = 0.25;
-
-  let map = null;
+  let map;
   let mapContainer;
-  let currentLngLat = null;
+  let currentRadius;
+  let cursorPosition = null;
+  let currentMode = 'landuse';
 
   // --- CONFIGURATION ---
-  const MAPBOX_TOKEN = 'pk.eyJ1IjoibW9ycGhvY29kZSIsImEiOiJVMnRPS0drIn0.QrB-bpBR5Tgnxa6nc9TqmQ';
-  const TILESET_ID = 'mapbox://kai-erlenbusch.9a769cf2';
-  const SOURCE_LAYER_NAME = 'mn_mappluto-d8n2zk';
+  const MAPBOX_TOKEN = 'pk.eyJ1Ijoia2FpLWVybGVuYnVzY2giLCJhIjoiY21qZzM5Z3FnMHk3MTNkcHNrcDJ0ajFpNyJ9.X4SxJOFBNAxGo8G5qHLKXA';
+  
+  const LANDUSE_TILESET_ID = 'mapbox://kai-erlenbusch.9a769cf2';
+  const LANDUSE_SOURCE_LAYER = 'mn_mappluto-d8n2zk';
+
+  const CENSUS_TILESET_ID = 'mapbox://kai-erlenbusch.cxab71ns';
+  const CENSUS_SOURCE_LAYER = 'census_dots-bf63fb';
 
   const WORLD_MASK = turf.polygon([[
     [-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]
   ]]);
 
-  // Reactive Statement
-  $: if (map && map.getSource('mask-source') && currentLngLat && radius) {
-    runSpatialEngine(currentLngLat);
+  const unsubscribeRadius = radius.subscribe(value => {
+    currentRadius = value;
+    if (map && cursorPosition) updateMapState(cursorPosition);
+  });
+
+  const unsubscribeLayer = activeLayer.subscribe(value => {
+    currentMode = value;
+    if (!map || !map.isStyleLoaded()) return;
+    
+    const isLandUse = value === 'landuse';
+
+    if (map.getLayer('pluto-fill')) map.setLayoutProperty('pluto-fill', 'visibility', isLandUse ? 'visible' : 'none');
+    if (map.getLayer('pluto-lines')) map.setLayoutProperty('pluto-lines', 'visibility', isLandUse ? 'visible' : 'none');
+    if (map.getLayer('mask-layer')) map.setLayoutProperty('mask-layer', 'visibility', isLandUse ? 'visible' : 'none');
+    
+    if (map.getLayer('census-dots')) map.setLayoutProperty('census-dots', 'visibility', isLandUse ? 'none' : 'visible');
+
+    if (cursorPosition) updateMapState(cursorPosition);
+  });
+
+  function updateMapState(lngLat) {
+    if (!map) return;
+    cursorPosition = lngLat;
+
+    const centerPoint = turf.point([lngLat.lng, lngLat.lat]);
+    const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 64, units: 'miles' });
+
+    if (map.getSource('mask-source')) {
+        const maskGeometry = turf.difference(turf.featureCollection([WORLD_MASK, circleGeo]));
+        map.getSource('mask-source').setData(maskGeometry);
+    }
+
+    if (currentMode === 'landuse') {
+        analyzeLandUse(circleGeo);
+    } else {
+        analyzeDemographics(circleGeo);
+    }
+  }
+
+  function analyzeLandUse(circleGeo) {
+    const bbox = turf.bbox(circleGeo);
+    const southWest = map.project([bbox[0], bbox[1]]);
+    const northEast = map.project([bbox[2], bbox[3]]);
+
+    const features = map.queryRenderedFeatures([southWest, northEast], { layers: ['pluto-fill'] });
+    
+    let totalArea = 0;
+    let counts = {};
+    
+    features.forEach(f => {
+       const rawLU = f.properties.LandUse; 
+       
+       // FORCE AREA CALCULATION (Since LotArea is missing in tiles)
+       const area = turf.area(f) * 0.000247105; 
+       
+       if (rawLU) {
+            const cleanKey = parseInt(String(rawLU), 10).toString();
+            if (cleanKey !== "NaN") {
+                if (!counts[cleanKey]) counts[cleanKey] = 0;
+                counts[cleanKey] += area;
+                totalArea += area;
+            }
+       }
+    });
+
+    let entropy = 0;
+    if (totalArea > 0) {
+        let H = 0;
+        Object.values(counts).forEach(a => {
+            const p = a / totalArea;
+            if (p > 0) H -= p * Math.log(p);
+        });
+        entropy = H / Math.log(11); 
+    }
+
+    const result = {
+        count: features.length,
+        area: totalArea,
+        breakdown: counts,
+        entropy: entropy
+    };
+
+    // CRITICAL FIX: Dispatch event so App.svelte passes data to Sidebar
+    dispatch('analysis', result); 
+    
+    // Also update store for safety
+    analysisData.set(result);
+  }
+
+  function analyzeDemographics(circleGeo) {
+    const features = map.queryRenderedFeatures({ layers: ['census-dots'] });
+    let totalPeople = 0;
+    let ethnicityCounts = {};
+
+    features.forEach(f => {
+        const pt = turf.point(f.geometry.coordinates);
+        if (turf.booleanPointInPolygon(pt, circleGeo)) {
+            const pop = f.properties.pop_est || 1; 
+            const eth = f.properties.ethnicity || 'Other';
+            
+            totalPeople += pop;
+            if (!ethnicityCounts[eth]) ethnicityCounts[eth] = 0;
+            ethnicityCounts[eth] += pop;
+        }
+    });
+
+    demographicsData.set({
+        totalPeople: totalPeople,
+        density: totalPeople / (Math.PI * currentRadius * currentRadius * 640), 
+        ethnicityBreakdown: ethnicityCounts
+    });
   }
 
   onMount(() => {
     map = new maplibregl.Map({
       container: mapContainer,
       style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
-      center: [-73.985, 40.748],
+      center: [-73.985, 40.748], 
       zoom: 13,
-      pitch: 0,
       transformRequest: (url) => {
         if (url.startsWith("mapbox://")) {
           return {
@@ -40,26 +152,21 @@
             headers: { "Content-Type": "application/json" }
           };
         }
-        if (url.includes("api.mapbox.com")) {
-          return { url: url.indexOf("?") > -1 ? url + `&access_token=${MAPBOX_TOKEN}` : url + `?access_token=${MAPBOX_TOKEN}` }
-        }
         return { url };
       }
     });
 
     map.on('load', () => {
-      map.addSource('pluto-data', { type: 'vector', url: TILESET_ID });
-
-      // 1. COLORS
+      // 1. LAND USE
+      map.addSource('pluto-data', { type: 'vector', url: LANDUSE_TILESET_ID });
       map.addLayer({
-        id: 'pluto-fill',
-        type: 'fill',
-        source: 'pluto-data',
-        'source-layer': SOURCE_LAYER_NAME,
-        paint: {
+        'id': 'pluto-fill',
+        'type': 'fill',
+        'source': 'pluto-data',
+        'source-layer': LANDUSE_SOURCE_LAYER,
+        'paint': {
           'fill-color': [
-            'match',
-            ['to-string', ['get', 'LandUse']],
+            'match', ['to-string', ['get', 'LandUse']], 
             '01', '#F9EDDB', '1', '#F9EDDB',
             '02', '#F6D9CB', '2', '#F6D9CB',
             '03', '#F6D9CB', '3', '#F6D9CB',
@@ -69,25 +176,47 @@
             '07', '#BEC6CC', '7', '#BEC6CC',
             '08', '#BDE7F4', '8', '#BDE7F4',
             '09', '#A3D393', '9', '#A3D393',
-            '10', '#8DA2B4',
-            '11', '#E4E4E4',
+            '10', '#8DA2B4', '11', '#E4E4E4',
             '#cccccc'
           ],
           'fill-opacity': 1
-        }
+        },
+        'layout': { 'visibility': 'visible' }
       });
 
-      // 2. LINES
       map.addLayer({
         id: 'pluto-lines',
         type: 'line',
         source: 'pluto-data',
-        'source-layer': SOURCE_LAYER_NAME,
+        'source-layer': LANDUSE_SOURCE_LAYER,
         paint: {
           'line-width': 0.5,
           'line-opacity': ['interpolate', ['linear'], ['zoom'], 13.5, 0, 15.5, 0.8],
           'line-color': ['interpolate', ['linear'], ['zoom'], 14, '#cccccc', 16, '#444444']
-        }
+        },
+        'layout': { 'visibility': 'visible' }
+      });
+
+      // 2. DEMOGRAPHICS
+      map.addSource('census-source', { type: 'vector', url: CENSUS_TILESET_ID });
+      map.addLayer({
+        id: 'census-dots',
+        type: 'circle',
+        source: 'census-source', 
+        'source-layer': CENSUS_SOURCE_LAYER,
+        paint: {
+          'circle-radius': 2,
+          'circle-color': [
+              'match', ['get', 'ethnicity'],
+              'Asian', '#E55E5E',
+              'Black', '#3182CE',
+              'Hispanic', '#DD6B20',
+              'White', '#38A169',
+              '#718096'
+          ],
+          'circle-opacity': 0.8
+        },
+        'layout': { 'visibility': 'none' }
       });
 
       // 3. MASK
@@ -103,74 +232,16 @@
       });
 
       map.on('mousemove', (e) => {
-        currentLngLat = [e.lngLat.lng, e.lngLat.lat];
+          updateMapState(e.lngLat);
       });
+      
+      updateMapState(map.getCenter());
     });
   });
 
-  function runSpatialEngine(center) {
-    if (!map.getLayer('pluto-fill')) return;
-
-    const circle = turf.circle(center, radius, { steps: 64, units: 'miles' });
-    const maskGeometry = turf.difference(turf.featureCollection([WORLD_MASK, circle]));
-    map.getSource('mask-source').setData(maskGeometry);
-
-    const bbox = turf.bbox(circle);
-    const southWest = map.project([bbox[0], bbox[1]]);
-    const northEast = map.project([bbox[2], bbox[3]]);
-    
-    const candidates = map.queryRenderedFeatures(
-      [southWest, northEast], 
-      { layers: ['pluto-fill'] }
-    );
-
-    const insideFeatures = candidates.filter(feature => {
-      return turf.booleanIntersects(feature, circle);
-    });
-
-    // --- ANALYTICS ENGINE ---
-    const breakdown = {};
-    let totalArea = 0;
-
-    insideFeatures.forEach(feature => {
-      const featureAcres = (feature.properties.LotArea || turf.area(feature)) * 0.000247105;
-      totalArea += featureAcres;
-
-      const rawLU = feature.properties.LandUse;
-      if (rawLU) {
-        const stringLU = String(rawLU);
-        const cleanKey = parseInt(stringLU, 10).toString();
-        
-        if (cleanKey && cleanKey !== "NaN") {
-          breakdown[cleanKey] = (breakdown[cleanKey] || 0) + featureAcres;
-        }
-      }
-    });
-
-    // --- ENTROPY CALCULATION (Shannon Index) ---
-    let entropy = 0;
-    if (totalArea > 0) {
-      let H = 0;
-      Object.values(breakdown).forEach(area => {
-        const p = area / totalArea; // Proportion of this category
-        if (p > 0) {
-          H -= p * Math.log(p); // -p * ln(p)
-        }
-      });
-      // Normalize (0 to 1) by dividing by ln(11 categories)
-      const maxEntropy = Math.log(11);
-      entropy = H / maxEntropy;
-    }
-
-    dispatch('analysis', {
-      count: insideFeatures.length,
-      area: totalArea,
-      breakdown: breakdown,
-      entropy: entropy // <--- Sending the Score!
-    });
-  }
-
   onDestroy(() => {
+    unsubscribeRadius();
+    unsubscribeLayer();
     if (map) map.remove();
   });
 </script>
