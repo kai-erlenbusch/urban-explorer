@@ -10,17 +10,23 @@
   let currentRadius;
   let cursorPosition = null;
   let currentMode = 'landuse';
+  
+  // Performance Throttling
+  let animationFrameId;
+  let isUpdating = false;
 
   // --- CONFIGURATION ---
   const MAPBOX_TOKEN = 'pk.eyJ1Ijoia2FpLWVybGVuYnVzY2giLCJhIjoiY21qZzM5Z3FnMHk3MTNkcHNrcDJ0ajFpNyJ9.X4SxJOFBNAxGo8G5qHLKXA';
-  
   const LANDUSE_TILESET_ID = 'mapbox://kai-erlenbusch.9a769cf2';
   const LANDUSE_SOURCE_LAYER = 'mn_mappluto-d8n2zk';
   const CENSUS_TILESET_ID = 'mapbox://kai-erlenbusch.0ua9vbjj';
   const CENSUS_SOURCE_LAYER = 'census_dots_full';
-  const TRANSIT_TILESET_ID = 'mapbox://kai-erlenbusch.ydqfgcin'; 
+  const TRANSIT_TILESET_ID = 'mapbox://kai-erlenbusch.ydqfgcin';
 
-  // World Mask
+  // We will load this from the internet or fallback to a box
+  let MANHATTAN_MASK = null; 
+  
+  // Fallback World Mask
   const WORLD_MASK = turf.polygon([[
     [-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]
   ]]);
@@ -28,7 +34,7 @@
   // --- STORES ---
   const unsubscribeRadius = radius.subscribe(value => {
     currentRadius = value;
-    if (map && cursorPosition) updateMapState(cursorPosition);
+    if (map && cursorPosition) triggerUpdate(cursorPosition);
   });
 
   const unsubscribeLayer = activeLayer.subscribe(value => {
@@ -39,7 +45,9 @@
     const isDemo = value === 'demographics';
     const isTransit = value === 'transit';
 
+    // 1. Toggle Data Layers
     if (map.getLayer('pluto-fill')) map.setLayoutProperty('pluto-fill', 'visibility', isLandUse ? 'visible' : 'none');
+    if (map.getLayer('pluto-lines')) map.setLayoutProperty('pluto-lines', 'visibility', isLandUse ? 'visible' : 'none');
     if (map.getLayer('census-dots')) map.setLayoutProperty('census-dots', 'visibility', isDemo ? 'visible' : 'none');
 
     const transitIds = [
@@ -53,23 +61,51 @@
         if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', isTransit ? 'visible' : 'none');
     });
 
+    // 2. TOGGLE MASKS & WATER (The Winning Logic)
+    if (map.getLayer('mask-layer-top')) {
+         map.setLayoutProperty('mask-layer-top', 'visibility', isTransit ? 'visible' : 'none');
+    }
+    if (map.getLayer('mask-layer-bottom')) {
+         map.setLayoutProperty('mask-layer-bottom', 'visibility', isTransit ? 'none' : 'visible');
+    }
+    if (map.getLayer('water-rescue')) {
+         map.setLayoutProperty('water-rescue', 'visibility', isTransit ? 'visible' : 'none');
+    }
+
     setTimeout(() => {
-        if (cursorPosition) updateMapState(cursorPosition);
+        if (cursorPosition) triggerUpdate(cursorPosition);
     }, 100);
   });
 
-  // --- ENGINE ---
+  // --- OPTIMIZED ENGINE ---
+  function triggerUpdate(lngLat) {
+      cursorPosition = lngLat;
+      if (!isUpdating) {
+          isUpdating = true;
+          animationFrameId = requestAnimationFrame(() => {
+              updateMapState(lngLat);
+              isUpdating = false;
+          });
+      }
+  }
+
   function updateMapState(lngLat) {
     if (!map) return;
-    cursorPosition = lngLat;
 
     const centerPoint = turf.point([lngLat.lng, lngLat.lat]);
     const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 64, units: 'miles' });
-
-    // Update Mask
+    
+    // UPDATE MASK GEOMETRY (Manhattan - Circle)
     if (map.getSource('mask-source')) {
-        const maskGeometry = turf.difference(turf.featureCollection([WORLD_MASK, circleGeo]));
-        map.getSource('mask-source').setData(maskGeometry);
+        let maskBase = MANHATTAN_MASK || WORLD_MASK;
+        let maskGeometry;
+        try {
+            // Using the simplified maskBase makes this 10x faster
+            maskGeometry = turf.difference(turf.featureCollection([maskBase, circleGeo]));
+        } catch(e) {
+            maskGeometry = maskBase;
+        }
+        if (maskGeometry) map.getSource('mask-source').setData(maskGeometry);
     }
 
     // Update Lens Outline
@@ -82,7 +118,7 @@
     else if (currentMode === 'transit') analyzeTransit(centerPoint);
   }
 
-  // ... (Analyze functions skipped for brevity, they remain identical to previous working version) ...
+  // --- ANALYSIS FUNCTIONS ---
   function analyzeLandUse(circleGeo) {
     const bbox = turf.bbox(circleGeo);
     const southWest = map.project([bbox[0], bbox[1]]);
@@ -115,7 +151,8 @@
 
   function analyzeDemographics(centerPoint) {
     const features = map.queryRenderedFeatures({ layers: ['census-dots'] });
-    let totalPeople = 0; let ethnicityCounts = {}; let femaleCount = 0; 
+    let totalPeople = 0;
+    let ethnicityCounts = {}; let femaleCount = 0; 
     let ageCounts = { '0-4': 0, '5-17': 0, '18-34': 0, '35-59': 0, '60+': 0 };
     const radiusKm = currentRadius * 1.60934;
     features.forEach(f => {
@@ -124,7 +161,8 @@
             const eth = f.properties.ethnicity || 'Other';
             const pop = f.properties.pop_est || 1; 
             totalPeople += pop;
-            if (!ethnicityCounts[eth]) ethnicityCounts[eth] = 0; ethnicityCounts[eth] += pop;
+            if (!ethnicityCounts[eth]) ethnicityCounts[eth] = 0; 
+            ethnicityCounts[eth] += pop;
             if (f.properties.sex === 'Female') femaleCount += pop;
             const age = f.properties.age_group;
             if (age && ageCounts[age] !== undefined) ageCounts[age] += pop;
@@ -157,7 +195,7 @@
     });
     const subTracks = map.queryRenderedFeatures(bboxPixels, { layers: ['transit-subway-lines'] });
     subTracks.forEach(f => { const line = f.properties.route_id || f.properties.route_shor || f.properties.name; if (line) foundSubLines.add(line); });
-
+    
     const railStations = map.queryRenderedFeatures({ layers: ['transit-rail-stations-rail_lirr_stops', 'transit-rail-stations-rail_mnr_stops', 'transit-rail-stations-rail_njt_stops', 'transit-rail-stations-rail_amtrak_stops', 'transit-rail-stations-rail_path_stops'] });
     const foundRailLines = new Set();
     let railCount = 0;
@@ -174,7 +212,6 @@
         const id = f.layer.id;
         if (id.includes("lirr")) foundRailLines.add("LIRR"); else if (id.includes("mnr")) foundRailLines.add("Metro-North"); else if (id.includes("njt")) foundRailLines.add("NJ Transit"); else if (id.includes("amtrak")) foundRailLines.add("Amtrak"); else if (id.includes("path")) foundRailLines.add("PATH");
     });
-
     const busStops = map.queryRenderedFeatures({ layers: ['transit-bus-stops'] });
     let busStopCount = 0;
     busStops.forEach(f => { const pt = turf.point(f.geometry.coordinates); if (turf.distance(centerPoint, pt, {units: 'kilometers'}) <= radiusKm) busStopCount++; });
@@ -185,11 +222,25 @@
         const name = props.route_id || props.route_short_name || props.route_short || props.ref || props.name;
         if (name) { const cleanName = name.split(' ')[0]; if (cleanName.length > 0 && cleanName.length < 6) foundBusLines.add(cleanName); else foundBusLines.add(name); }
     });
-
     transitData.set({ subwayStationCount: subCount, subwayLines: Array.from(foundSubLines).sort(), railStationCount: railCount, railLines: Array.from(foundRailLines).sort(), busStopCount: busStopCount, busLines: Array.from(foundBusLines).sort((a, b) => a.localeCompare(b, undefined, {numeric: true})) });
   }
 
-  onMount(() => {
+  onMount(async () => {
+    // 1. FETCH MANHATTAN & SIMPLIFY (Performance Fix)
+    try {
+        const response = await fetch('https://raw.githubusercontent.com/dwillis/nyc-maps/master/boroughs.geojson');
+        const data = await response.json();
+        const manhattan = data.features.find(f => f.properties.BoroName === 'Manhattan');
+        if (manhattan) {
+            // Simplify geometry to reduce CPU load during turf.difference
+            // tolerance: 0.0001 is high detail, 0.001 is rougher but faster
+            MANHATTAN_MASK = turf.simplify(manhattan, {tolerance: 0.0001, highQuality: false});
+        }
+    } catch (err) {
+        console.warn('Could not fetch Manhattan boundary, using World mask.', err);
+    }
+
+    // 2. INIT MAP
     map = new maplibregl.Map({
       container: mapContainer,
       style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
@@ -213,21 +264,18 @@
       // 1. HIDE BUILDINGS
       layers.forEach(layer => {
           if (layer.id.includes('building')) {
-              map.setLayoutProperty(layer.id, 'visibility', 'none');
+            map.setLayoutProperty(layer.id, 'visibility', 'none');
           }
       });
 
-      // 2. FIND "WATER" OR "ROAD" LAYER (Insertion Point)
-      // This is the fix. We want to insert our stuff BELOW water/roads.
+      // 2. FIND INSERTION POINT
       let insertionLayerId;
       for (const layer of layers) {
-        // We look for water first, as it's usually at the bottom of the "features" stack
         if (layer.id.includes('water') && layer.type === 'fill') {
           insertionLayerId = layer.id;
           break; 
         }
       }
-      // If no water layer found easily, fallback to roads or first label
       if (!insertionLayerId) {
          for (const layer of layers) {
             if (layer.id.includes('road') || layer.type === 'symbol') {
@@ -237,28 +285,47 @@
          }
       }
 
-      console.log("Inserting Data/Mask BELOW layer:", insertionLayerId);
-
-      // --- ADD DATA LAYERS (Insert at Bottom) ---
+      // 3. DYNAMIC WATER DETECTION (For Rescue Layer)
+      let waterSource = null;
+      let waterSourceLayer = null;
+      let waterColor = '#e0e0e0'; 
       
-      // Land Use
+      const waterRef = layers.find(l => l.id.includes('water') && l.type === 'fill');
+      if (waterRef) {
+          waterSource = waterRef.source;
+          waterSourceLayer = waterRef['source-layer'];
+          if (waterRef.paint && waterRef.paint['fill-color']) {
+             if (typeof waterRef.paint['fill-color'] === 'string') {
+                waterColor = waterRef.paint['fill-color'];
+             }
+          }
+      }
+
+      // 4. ADD DATA LAYERS (Bottom Stack)
+      
       map.addSource('pluto-data', { type: 'vector', url: LANDUSE_TILESET_ID });
       map.addLayer({
         'id': 'pluto-fill', 'type': 'fill', 'source': 'pluto-data', 'source-layer': LANDUSE_SOURCE_LAYER, 'minzoom': 10,
         'paint': { 
             'fill-color': [
                 'match', ['to-string', ['get', 'LandUse']], 
-                '01', '#F9EDDB', '1', '#F9EDDB', '02', '#F6D9CB', '2', '#F6D9CB', '03', '#F6D9CB', '3', '#F6D9CB',
-                '04', '#F1B89C', '4', '#F1B89C', '05', '#DF7649', '5', '#DF7649', '06', '#CF4F4F', '6', '#CF4F4F',
-                '07', '#BEC6CC', '7', '#BEC6CC', '08', '#BDE7F4', '8', '#BDE7F4', '09', '#A3D393', '9', '#A3D393',
-                '10', '#8DA2B4', '11', '#E4E4E4', '#cccccc'
+                '01', '#F9EDDB', '1', '#F9EDDB', '02', '#F6D9CB', '2', '#F6D9CB',
+                '03', '#F6D9CB', '3', '#F6D9CB', '04', '#F1B89C', '4', '#F1B89C',
+                '05', '#DF7649', '5', '#DF7649', '06', '#CF4F4F', '6', '#CF4F4F',
+                '07', '#BEC6CC', '7', '#BEC6CC', '08', '#BDE7F4', '8', '#BDE7F4',
+                '09', '#A3D393', '9', '#A3D393', '10', '#8DA2B4', '11', '#E4E4E4', '#cccccc'
             ],
             'fill-opacity': 1 
         },
         'layout': { 'visibility': 'visible' }
       }, insertionLayerId);
-      
-      // Demographics
+
+      map.addLayer({
+        'id': 'pluto-lines', 'type': 'line', 'source': 'pluto-data', 'source-layer': LANDUSE_SOURCE_LAYER,
+        'paint': { 'line-width': 0.5, 'line-opacity': ['interpolate', ['linear'], ['zoom'], 11, 0, 13, 0.6], 'line-color': '#cccccc' },
+        'layout': { 'visibility': 'visible' }
+      }, insertionLayerId);
+
       map.addSource('census-source', { type: 'vector', url: CENSUS_TILESET_ID });
       map.addLayer({
         id: 'census-dots', type: 'circle', source: 'census-source', 'source-layer': CENSUS_SOURCE_LAYER, minzoom: 8, 
@@ -270,70 +337,80 @@
         'layout': { 'visibility': 'none' }
       }, insertionLayerId);
 
-      // Transit Layers
-      map.addSource('transit-source', { type: 'vector', url: TRANSIT_TILESET_ID });
-      const transitLayers = [
-          {id: 'transit-bus-lines', type: 'line', src: 'bus_routes', paint: {'line-color': '#0245ef', 'line-width': 1, 'line-opacity': 0.8}},
-          {id: 'transit-bus-stops', type: 'circle', src: 'bus_stops', paint: {'circle-color': '#0245ef', 'circle-radius': ['interpolate', ['linear'], ['zoom'], 12, 1, 15, 2.5]}},
-          {id: 'transit-subway-lines', type: 'line', src: 'subway_lines', paint: {'line-width': 2.5, 'line-color': '#ffd73e'}},
-          {id: 'transit-subway-stations', type: 'circle', src: 'subway_stations', paint: {'circle-radius': 3.5, 'circle-color': '#ffffff', 'circle-stroke-width': 2, 'circle-stroke-color': '#ffd73e'}},
-      ];
-      transitLayers.forEach(l => {
-          map.addLayer({
-              id: l.id, type: l.type, source: 'transit-source', 'source-layer': l.src, paint: l.paint, layout: { 'visibility': 'none' }
-          }, insertionLayerId);
-      });
+      // 5. MASK A: BOTTOM
+      map.addSource('mask-source', { type: 'geojson', data: WORLD_MASK });
+      map.addLayer({
+        id: 'mask-layer-bottom', type: 'fill', source: 'mask-source',
+        paint: { 'fill-color': '#ffffff', 'fill-opacity': 0.85 },
+        layout: { 'visibility': 'visible' }
+      }, insertionLayerId);
 
+      // 6. TRANSIT LAYERS (TOP STACK)
+      map.addSource('transit-source', { type: 'vector', url: TRANSIT_TILESET_ID });
+
+      map.addLayer({
+        id: 'transit-bus-lines', type: 'line', source: 'transit-source', 'source-layer': 'bus_routes',
+        paint: { 'line-color': '#0245ef', 'line-width': 1, 'line-opacity': 0.8 },
+        layout: { 'visibility': 'none' }
+      }); // Top
+      map.addLayer({
+        id: 'transit-bus-stops', type: 'circle', source: 'transit-source', 'source-layer': 'bus_stops',
+        paint: { 'circle-color': '#0245ef', 'circle-radius': ['interpolate', ['linear'], ['zoom'], 12, 1, 15, 2.5], 'circle-opacity': 0.6 },
+        layout: { 'visibility': 'none' }
+      });
+      map.addLayer({
+        id: 'transit-subway-lines', type: 'line', source: 'transit-source', 'source-layer': 'subway_lines',
+        paint: { 'line-width': 2.5, 'line-color': '#ffd73e' },
+        layout: { 'visibility': 'none' }
+      });
       ['rail_lirr', 'rail_mnr', 'rail_njt', 'rail_amtrak', 'rail_path'].forEach(agency => {
           map.addLayer({
             id: `transit-rail-lines-${agency}_routes`, type: 'line', source: 'transit-source', 'source-layer': `${agency}_routes`,
             paint: { 'line-color': '#ff98ab', 'line-width': 1.5 }, layout: { 'visibility': 'none' }
-          }, insertionLayerId);
+          });
+      });
+      map.addLayer({
+        id: 'transit-subway-stations', type: 'circle', source: 'transit-source', 'source-layer': 'subway_stations',
+        paint: { 'circle-radius': 3.5, 'circle-color': '#ffffff', 'circle-stroke-width': 2, 'circle-stroke-color': '#ffd73e' },
+        layout: { 'visibility': 'none' }
+      });
+      ['rail_lirr', 'rail_mnr', 'rail_njt', 'rail_amtrak', 'rail_path'].forEach(agency => {
           map.addLayer({
             id: `transit-rail-stations-${agency}_stops`, type: 'circle', source: 'transit-source', 'source-layer': `${agency}_stops`,
             paint: { 'circle-radius': 3, 'circle-color': '#ff98ab', 'circle-stroke-width': 1, 'circle-stroke-color': '#fff' }, layout: { 'visibility': 'none' }
-          }, insertionLayerId);
+          });
       });
 
-      // --- BUILDING OUTLINES (Inside Circle) ---
-      // We insert these with the data (below mask)
+      // 7. MASK B: TOP
       map.addLayer({
-          'id': 'building-outlines',
-          'type': 'line',
-          'source': 'composite',
-          'source-layer': 'building', 
-          'minzoom': 14,
-          'paint': {
-              'line-color': '#999999',
-              'line-width': 1,
-              'line-opacity': 0.4
-          }
-      }, insertionLayerId);
+        id: 'mask-layer-top', type: 'fill', source: 'mask-source',
+        paint: { 'fill-color': '#ffffff', 'fill-opacity': 0.85 },
+        layout: { 'visibility': 'none' } 
+      });
 
-      // --- MASK LAYER (Solid Gray) ---
-      // Inserted BEFORE 'water', so water/roads draw ON TOP of it.
-      // But inserted AFTER data (because we added data first to the stack).
-      map.addSource('mask-source', { type: 'geojson', data: WORLD_MASK });
-      map.addLayer({
-        id: 'mask-layer', type: 'fill', source: 'mask-source',
-        paint: { 
-            'fill-color': '#e5e5e5', // Map Gray 
-            'fill-opacity': 1.0     // Solid Mask covers Data
-        }
-      }, insertionLayerId);
+      // 8. WATER RESCUE OVERLAY (Topmost)
+      if (waterSource && waterSourceLayer) {
+        map.addLayer({
+            'id': 'water-rescue',
+            'type': 'fill',
+            'source': waterSource,
+            'source-layer': waterSourceLayer,
+            'paint': {
+                'fill-color': waterColor,
+                'fill-opacity': 1
+            },
+            'layout': { 'visibility': 'none' } 
+        });
+      }
 
-      // --- LENS OUTLINE (Always Top) ---
+      // 9. LENS OUTLINE (Topmost)
       map.addSource('lens-source', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addLayer({
         id: 'lens-outline', type: 'line', source: 'lens-source',
-        paint: {
-            'line-color': '#333333',
-            'line-width': 1.5,
-            'line-dasharray': [2, 3] 
-        }
-      }); // No 'beforeId', so it goes to the very top
+        paint: { 'line-color': '#333333', 'line-width': 1.5, 'line-dasharray': [2, 3] }
+      });
 
-      map.on('mousemove', (e) => updateMapState(e.lngLat));
+      map.on('mousemove', (e) => triggerUpdate(e.lngLat));
       updateMapState(map.getCenter());
     });
   });
@@ -341,6 +418,7 @@
   onDestroy(() => {
     unsubscribeRadius();
     unsubscribeLayer();
+    if (animationFrameId) cancelAnimationFrame(animationFrameId);
     if (map) map.remove();
   });
 </script>
