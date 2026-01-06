@@ -1,4 +1,7 @@
 <script>
+
+  console.log(">>> NEW MAP COMPONENT LOADED <<<");
+  
   import { onMount, onDestroy } from 'svelte';
   import { activeLayer, analysisData, demographicsData, transitData, radius } from './stores.js';
   import maplibregl from 'maplibre-gl';
@@ -15,18 +18,38 @@
   let animationFrameId;
   let isUpdating = false;
 
+  // --- RAW DATA STORAGE (For Accurate Analysis) ---
+  let rawCensusData = null;
+  let rawTransitData = {
+      subwayStations: null,
+      subwayLines: null,
+      busStops: null,
+      busLines: null,
+      rail: {
+          lirr: { stops: null, routes: null },
+          mnr: { stops: null, routes: null },
+          njt: { stops: null, routes: null },
+          amtrak: { stops: null, routes: null },
+          path: { stops: null, routes: null }
+      }
+  };
+
   // --- CONFIGURATION ---
-  const MAPBOX_TOKEN = 'pk.eyJ1Ijoia2FpLWVybGVuYnVzY2giLCJhIjoiY21qZzM5Z3FnMHk3MTNkcHNrcDJ0ajFpNyJ9.X4SxJOFBNAxGo8G5qHLKXA';
+  // Ideally move this token to an .env file (e.g. import.meta.env.VITE_MAPBOX_TOKEN)
+  const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN;
+
+  // Safety check: Warn if token is missing
+  if (!MAPBOX_TOKEN) {
+      console.error("Mapbox Token is missing! Make sure you created a .env file with VITE_MAPBOX_TOKEN.");
+  }
+  
   const LANDUSE_TILESET_ID = 'mapbox://kai-erlenbusch.9a769cf2';
   const LANDUSE_SOURCE_LAYER = 'mn_mappluto-d8n2zk';
   const CENSUS_TILESET_ID = 'mapbox://kai-erlenbusch.0ua9vbjj';
   const CENSUS_SOURCE_LAYER = 'census_dots_full';
   const TRANSIT_TILESET_ID = 'mapbox://kai-erlenbusch.ydqfgcin';
 
-  // We will load this from the internet or fallback to a box
-  let MANHATTAN_MASK = null; 
-  
-  // Fallback World Mask
+  let MANHATTAN_MASK = null;
   const WORLD_MASK = turf.polygon([[
     [-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]
   ]]);
@@ -61,23 +84,16 @@
         if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', isTransit ? 'visible' : 'none');
     });
 
-    // 2. TOGGLE MASKS & WATER (The Winning Logic)
-    if (map.getLayer('mask-layer-top')) {
-         map.setLayoutProperty('mask-layer-top', 'visibility', isTransit ? 'visible' : 'none');
-    }
-    if (map.getLayer('mask-layer-bottom')) {
-         map.setLayoutProperty('mask-layer-bottom', 'visibility', isTransit ? 'none' : 'visible');
-    }
-    if (map.getLayer('water-rescue')) {
-         map.setLayoutProperty('water-rescue', 'visibility', isTransit ? 'visible' : 'none');
-    }
+    // 2. TOGGLE MASKS & WATER
+    if (map.getLayer('mask-layer-top')) map.setLayoutProperty('mask-layer-top', 'visibility', isTransit ? 'visible' : 'none');
+    if (map.getLayer('mask-layer-bottom')) map.setLayoutProperty('mask-layer-bottom', 'visibility', isTransit ? 'none' : 'visible');
+    if (map.getLayer('water-rescue')) map.setLayoutProperty('water-rescue', 'visibility', isTransit ? 'visible' : 'none');
 
-    setTimeout(() => {
-        if (cursorPosition) triggerUpdate(cursorPosition);
-    }, 100);
+    // Trigger update to refresh analysis for new mode
+    if (cursorPosition) triggerUpdate(cursorPosition);
   });
 
-  // --- OPTIMIZED ENGINE ---
+  // --- ENGINE ---
   function triggerUpdate(lngLat) {
       cursorPosition = lngLat;
       if (!isUpdating) {
@@ -94,13 +110,12 @@
 
     const centerPoint = turf.point([lngLat.lng, lngLat.lat]);
     const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 64, units: 'miles' });
-    
-    // UPDATE MASK GEOMETRY (Manhattan - Circle)
+
+    // UPDATE VISUALS (Mask & Lens)
     if (map.getSource('mask-source')) {
         let maskBase = MANHATTAN_MASK || WORLD_MASK;
         let maskGeometry;
         try {
-            // Using the simplified maskBase makes this 10x faster
             maskGeometry = turf.difference(turf.featureCollection([maskBase, circleGeo]));
         } catch(e) {
             maskGeometry = maskBase;
@@ -108,22 +123,192 @@
         if (maskGeometry) map.getSource('mask-source').setData(maskGeometry);
     }
 
-    // Update Lens Outline
     if (map.getSource('lens-source')) {
         map.getSource('lens-source').setData(circleGeo);
     }
 
+    // RUN ANALYSIS
     if (currentMode === 'landuse') analyzeLandUse(circleGeo);
     else if (currentMode === 'demographics') analyzeDemographics(centerPoint);
     else if (currentMode === 'transit') analyzeTransit(centerPoint);
   }
 
-  // --- ANALYSIS FUNCTIONS ---
+  // --- NEW RAW DATA ANALYSIS FUNCTIONS ---
+
+  function analyzeDemographics(centerPoint) {
+    if (!rawCensusData) return;
+
+    const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 64, units: 'miles' });
+    const bbox = turf.bbox(circleGeo); 
+    const radiusKm = currentRadius * 1.60934;
+
+    let totalPeople = 0;
+    let ethnicityCounts = {}; 
+    let femaleCount = 0; 
+    let ageCounts = { '0-4': 0, '5-17': 0, '18-34': 0, '35-59': 0, '60+': 0 };
+
+    // DETECT KEYS DYNAMICALLY (Case-Insensitive)
+    // We check the first feature to find the actual property names in your raw file
+    const sampleProps = rawCensusData.features[0]?.properties || {};
+    const keys = Object.keys(sampleProps);
+    const keyEth = keys.find(k => k.toLowerCase() === 'ethnicity') || 'ethnicity';
+    const keyAge = keys.find(k => k.toLowerCase() === 'age_group') || 'age_group';
+    const keySex = keys.find(k => k.toLowerCase() === 'sex') || 'sex';
+    const keyPop = keys.find(k => k.toLowerCase() === 'pop_est') || 'pop_est';
+
+    for (const f of rawCensusData.features) {
+        const coords = f.geometry.coordinates;
+
+        // 1. Fast BBox Exclusion
+        if (coords[0] < bbox[0] || coords[0] > bbox[2] || coords[1] < bbox[1] || coords[1] > bbox[3]) continue;
+
+        // 2. Precise Distance Check
+        const pt = turf.point(coords);
+        if (turf.distance(centerPoint, pt, { units: 'kilometers' }) <= radiusKm) {
+             const props = f.properties;
+             
+             // Use the dynamic keys we found above
+             const pop = props[keyPop] || 1; 
+             const eth = props[keyEth] || 'Other';
+ 
+             totalPeople += pop;
+ 
+             // Ethnicity
+             if (!ethnicityCounts[eth]) ethnicityCounts[eth] = 0; 
+             ethnicityCounts[eth] += pop;
+ 
+             // Gender
+             if (props[keySex] === 'Female') femaleCount += pop;
+ 
+             // Age
+             const age = props[keyAge];
+             if (age && ageCounts[age] !== undefined) ageCounts[age] += pop;
+        }
+    }
+
+    // DEBUG: Uncomment this if charts are still empty to see what keys are being found
+    console.log("Detected Keys:", { keyEth, keyAge, keySex, keyPop });
+    console.log("Sample Counts:", { ethnicityCounts, ageCounts });
+
+    let sumSquares = 0;
+    if (totalPeople > 0) { 
+        Object.values(ethnicityCounts).forEach(count => { 
+            const p = count / totalPeople; 
+            sumSquares += p * p; 
+        });
+    }
+
+    demographicsData.set({ 
+        totalPeople, 
+        density: totalPeople / (Math.PI * currentRadius * currentRadius * 640), 
+        ethnicityBreakdown: ethnicityCounts, 
+        diversityIndex: totalPeople > 0 ? (1 - sumSquares) : 0, 
+        percentFemale: totalPeople > 0 ? (femaleCount / totalPeople) * 100 : 0, 
+        ageBreakdown: ageCounts 
+    });
+  }
+
+  function analyzeTransit(centerPoint) {
+      if (!rawTransitData.subwayStations) return;
+
+      const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 32, units: 'miles' });
+      const bbox = turf.bbox(circleGeo);
+
+      // Helper: Check points
+      const countPoints = (featureCollection) => {
+          if (!featureCollection) return 0;
+          // Using turf.pointsWithinPolygon is cleaner for collections
+          const pts = turf.pointsWithinPolygon(featureCollection, circleGeo);
+          return pts.features.length;
+      };
+
+      // Helper: Check lines (using BBox first for speed)
+      const getIntersectingLines = (featureCollection, nameField) => {
+          const found = new Set();
+          if (!featureCollection) return found;
+
+          for (const f of featureCollection.features) {
+              // BBox overlap check (simple approximation)
+              const fBbox = turf.bbox(f);
+              const overlap = !(bbox[0] > fBbox[2] || bbox[2] < fBbox[0] || bbox[1] > fBbox[3] || bbox[3] < fBbox[1]);
+              
+              if (overlap) {
+                  // Precise check
+                  if (turf.booleanIntersects(f, circleGeo)) {
+                      const name = f.properties[nameField] || f.properties.route_id || f.properties.name;
+                      if (name) found.add(name);
+                  }
+              }
+          }
+          return found;
+      };
+
+      // 1. Subway
+      const subStationsInside = turf.pointsWithinPolygon(rawTransitData.subwayStations, circleGeo);
+      const subCount = subStationsInside.features.length;
+      const foundSubLines = new Set();
+      
+      // Get lines from stations
+      subStationsInside.features.forEach(f => {
+          const linesStr = f.properties.trains || f.properties.lines || f.properties.name || "";
+          const parts = linesStr.split(/[\s-]+/); 
+          parts.forEach(p => { if (/^[A-Z0-9]+$/.test(p) && p.length <= 2) foundSubLines.add(p); });
+      });
+      // Get lines from tracks
+      const trackLines = getIntersectingLines(rawTransitData.subwayLines, 'route_id');
+      trackLines.forEach(l => foundSubLines.add(l));
+
+      // 2. Rail
+      let railCount = 0;
+      const foundRailLines = new Set();
+      
+      const railAgencies = [
+          { key: 'lirr', name: 'LIRR' }, { key: 'mnr', name: 'Metro-North' },
+          { key: 'njt', name: 'NJ Transit' }, { key: 'amtrak', name: 'Amtrak' },
+          { key: 'path', name: 'PATH' }
+      ];
+
+      railAgencies.forEach(agency => {
+          const stops = rawTransitData.rail[agency.key].stops;
+          const routes = rawTransitData.rail[agency.key].routes;
+
+          // Count stops
+          const agencyStops = countPoints(stops);
+          if (agencyStops > 0) {
+              railCount += agencyStops;
+              foundRailLines.add(agency.name);
+          }
+          
+          // Check routes
+          const agencyRoutes = getIntersectingLines(routes, 'route_id'); // Field name might vary
+          if (agencyRoutes.size > 0) foundRailLines.add(agency.name);
+      });
+
+      // 3. Bus
+      const busStopCount = countPoints(rawTransitData.busStops);
+      const busLinesSet = getIntersectingLines(rawTransitData.busLines, 'route_short_name'); // usually route_short_name or route_id
+
+      transitData.set({ 
+          subwayStationCount: subCount, 
+          subwayLines: Array.from(foundSubLines).sort(), 
+          railStationCount: railCount, 
+          railLines: Array.from(foundRailLines).sort(), 
+          busStopCount: busStopCount, 
+          busLines: Array.from(busLinesSet).sort((a, b) => a.localeCompare(b, undefined, {numeric: true})) 
+      });
+  }
+
+  // Keep Land Use as-is (Rendered Features) for now due to dataset size
   function analyzeLandUse(circleGeo) {
+    if (!map) return;
     const bbox = turf.bbox(circleGeo);
     const southWest = map.project([bbox[0], bbox[1]]);
     const northEast = map.project([bbox[2], bbox[3]]);
+    
+    // Note: queryRenderedFeatures depends on zoom. 
+    // For PLUTO, this is an acceptable tradeoff vs loading 500MB
     const features = map.queryRenderedFeatures([southWest, northEast], { layers: ['pluto-fill'] });
+    
     let totalArea = 0; let counts = {}; const seenIds = new Set();
     features.forEach(f => {
         const uniqueId = f.id || f.properties.BBL || f.properties.LotArea;
@@ -135,7 +320,9 @@
             if (rawLU) {
                 const cleanKey = parseInt(String(rawLU), 10).toString();
                 if (cleanKey && cleanKey !== "NaN") {
-                    if (!counts[cleanKey]) counts[cleanKey] = 0; counts[cleanKey] += area; totalArea += area;
+                    if (!counts[cleanKey]) counts[cleanKey] = 0; 
+                    counts[cleanKey] += area; 
+                    totalArea += area;
                 }
             }
         }
@@ -149,98 +336,66 @@
     analysisData.set({ count: seenIds.size, area: totalArea, breakdown: counts, entropy });
   }
 
-  function analyzeDemographics(centerPoint) {
-    const features = map.queryRenderedFeatures({ layers: ['census-dots'] });
-    let totalPeople = 0;
-    let ethnicityCounts = {}; let femaleCount = 0; 
-    let ageCounts = { '0-4': 0, '5-17': 0, '18-34': 0, '35-59': 0, '60+': 0 };
-    const radiusKm = currentRadius * 1.60934;
-    features.forEach(f => {
-        const pt = turf.point(f.geometry.coordinates);
-        if (turf.distance(centerPoint, pt, {units: 'kilometers'}) <= radiusKm) {
-            const eth = f.properties.ethnicity || 'Other';
-            const pop = f.properties.pop_est || 1; 
-            totalPeople += pop;
-            if (!ethnicityCounts[eth]) ethnicityCounts[eth] = 0; 
-            ethnicityCounts[eth] += pop;
-            if (f.properties.sex === 'Female') femaleCount += pop;
-            const age = f.properties.age_group;
-            if (age && ageCounts[age] !== undefined) ageCounts[age] += pop;
-        }
-    });
-    let sumSquares = 0;
-    if (totalPeople > 0) { Object.values(ethnicityCounts).forEach(count => { const p = count / totalPeople; sumSquares += p * p; }); }
-    demographicsData.set({ totalPeople, density: totalPeople / (Math.PI * currentRadius * currentRadius * 640), ethnicityBreakdown: ethnicityCounts, diversityIndex: totalPeople > 0 ? (1 - sumSquares) : 0, percentFemale: totalPeople > 0 ? (femaleCount / totalPeople) * 100 : 0, ageBreakdown: ageCounts });
-  }
-
-  function analyzeTransit(centerPoint) {
-    const radiusKm = currentRadius * 1.60934;
-    const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 16, units: 'miles' });
-    const bbox = turf.bbox(circleGeo);
-    const p1 = map.project([bbox[0], bbox[1]]);
-    const p2 = map.project([bbox[2], bbox[3]]);
-    const bboxPixels = [p1, p2];
-
-    const subStations = map.queryRenderedFeatures({ layers: ['transit-subway-stations'] });
-    const foundSubLines = new Set();
-    let subCount = 0;
-    subStations.forEach(f => {
-        const pt = turf.point(f.geometry.coordinates);
-        if (turf.distance(centerPoint, pt, {units: 'kilometers'}) <= radiusKm) {
-            subCount++;
-            const linesStr = f.properties.trains || f.properties.lines || f.properties.name || "";
-            const parts = linesStr.split(/[\s-]+/); 
-            parts.forEach(p => { if (/^[A-Z0-9]+$/.test(p) && p.length <= 2) foundSubLines.add(p); });
-        }
-    });
-    const subTracks = map.queryRenderedFeatures(bboxPixels, { layers: ['transit-subway-lines'] });
-    subTracks.forEach(f => { const line = f.properties.route_id || f.properties.route_shor || f.properties.name; if (line) foundSubLines.add(line); });
-    
-    const railStations = map.queryRenderedFeatures({ layers: ['transit-rail-stations-rail_lirr_stops', 'transit-rail-stations-rail_mnr_stops', 'transit-rail-stations-rail_njt_stops', 'transit-rail-stations-rail_amtrak_stops', 'transit-rail-stations-rail_path_stops'] });
-    const foundRailLines = new Set();
-    let railCount = 0;
-    railStations.forEach(f => {
-        const pt = turf.point(f.geometry.coordinates);
-        if (turf.distance(centerPoint, pt, {units: 'kilometers'}) <= radiusKm) {
-            railCount++;
-            const id = f.layer.id;
-            if (id.includes("lirr")) foundRailLines.add("LIRR"); else if (id.includes("mnr")) foundRailLines.add("Metro-North"); else if (id.includes("njt")) foundRailLines.add("NJ Transit"); else if (id.includes("amtrak")) foundRailLines.add("Amtrak"); else if (id.includes("path")) foundRailLines.add("PATH");
-        }
-    });
-    const railTracks = map.queryRenderedFeatures(bboxPixels, { layers: ['transit-rail-lines-rail_lirr_routes', 'transit-rail-lines-rail_mnr_routes', 'transit-rail-lines-rail_njt_routes', 'transit-rail-lines-rail_amtrak_routes', 'transit-rail-lines-rail_path_routes'] });
-    railTracks.forEach(f => {
-        const id = f.layer.id;
-        if (id.includes("lirr")) foundRailLines.add("LIRR"); else if (id.includes("mnr")) foundRailLines.add("Metro-North"); else if (id.includes("njt")) foundRailLines.add("NJ Transit"); else if (id.includes("amtrak")) foundRailLines.add("Amtrak"); else if (id.includes("path")) foundRailLines.add("PATH");
-    });
-    const busStops = map.queryRenderedFeatures({ layers: ['transit-bus-stops'] });
-    let busStopCount = 0;
-    busStops.forEach(f => { const pt = turf.point(f.geometry.coordinates); if (turf.distance(centerPoint, pt, {units: 'kilometers'}) <= radiusKm) busStopCount++; });
-    const busLinesFeatures = map.queryRenderedFeatures(bboxPixels, { layers: ['transit-bus-lines'] });
-    const foundBusLines = new Set();
-    busLinesFeatures.forEach(f => {
-        const props = f.properties;
-        const name = props.route_id || props.route_short_name || props.route_short || props.ref || props.name;
-        if (name) { const cleanName = name.split(' ')[0]; if (cleanName.length > 0 && cleanName.length < 6) foundBusLines.add(cleanName); else foundBusLines.add(name); }
-    });
-    transitData.set({ subwayStationCount: subCount, subwayLines: Array.from(foundSubLines).sort(), railStationCount: railCount, railLines: Array.from(foundRailLines).sort(), busStopCount: busStopCount, busLines: Array.from(foundBusLines).sort((a, b) => a.localeCompare(b, undefined, {numeric: true})) });
-  }
-
   onMount(async () => {
-    // 1. FETCH MANHATTAN & SIMPLIFY (Performance Fix)
+    // 1. START LOADING DATA PARALLEL
+    const loadData = async () => {
+        try {
+            // Adjust paths if your file names differ
+            const responses = await Promise.all([
+                fetch('/data/census_dots_full.geojson').then(r => r.json()),
+                fetch('/data/subway_stations.geojson').then(r => r.json()),
+                fetch('/data/subway_lines.geojson').then(r => r.json()),
+                fetch('/data/bus_stops.geojson').then(r => r.json()),
+                fetch('/data/bus_routes.geojson').then(r => r.json()),
+                // Rails
+                fetch('/data/rail_lirr_stops.geojson').then(r => r.json()),
+                fetch('/data/rail_lirr_routes.geojson').then(r => r.json()),
+                fetch('/data/rail_mnr_stops.geojson').then(r => r.json()),
+                fetch('/data/rail_mnr_routes.geojson').then(r => r.json()),
+                fetch('/data/rail_njt_stops.geojson').then(r => r.json()),
+                fetch('/data/rail_njt_routes.geojson').then(r => r.json()),
+                fetch('/data/rail_amtrak_stops.geojson').then(r => r.json()),
+                fetch('/data/rail_amtrak_routes.geojson').then(r => r.json()),
+                fetch('/data/rail_path_stops.geojson').then(r => r.json()),
+                fetch('/data/rail_path_routes.geojson').then(r => r.json()),
+            ]);
+
+            rawCensusData = responses[0];
+            rawTransitData.subwayStations = responses[1];
+            rawTransitData.subwayLines = responses[2];
+            rawTransitData.busStops = responses[3];
+            rawTransitData.busLines = responses[4];
+            
+            // Map responses to structure
+            rawTransitData.rail.lirr = { stops: responses[5], routes: responses[6] };
+            rawTransitData.rail.mnr = { stops: responses[7], routes: responses[8] };
+            rawTransitData.rail.njt = { stops: responses[9], routes: responses[10] };
+            rawTransitData.rail.amtrak = { stops: responses[11], routes: responses[12] };
+            rawTransitData.rail.path = { stops: responses[13], routes: responses[14] };
+
+            console.log("Analysis data loaded successfully.");
+            // Trigger initial analysis if we are in analysis mode
+            if (map && cursorPosition) triggerUpdate(cursorPosition);
+
+        } catch (err) {
+            console.error("Error loading analysis data:", err);
+        }
+    };
+    loadData();
+
+    // 2. FETCH MANHATTAN BOUNDARY
     try {
         const response = await fetch('https://raw.githubusercontent.com/dwillis/nyc-maps/master/boroughs.geojson');
         const data = await response.json();
         const manhattan = data.features.find(f => f.properties.BoroName === 'Manhattan');
         if (manhattan) {
-            // Simplify geometry to reduce CPU load during turf.difference
-            // tolerance: 0.0001 is high detail, 0.001 is rougher but faster
             MANHATTAN_MASK = turf.simplify(manhattan, {tolerance: 0.0001, highQuality: false});
         }
     } catch (err) {
         console.warn('Could not fetch Manhattan boundary, using World mask.', err);
     }
 
-    // 2. INIT MAP
+    // 3. INIT MAP
     map = new maplibregl.Map({
       container: mapContainer,
       style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
@@ -261,14 +416,14 @@
     map.on('load', () => {
       const layers = map.getStyle().layers;
 
-      // 1. HIDE BUILDINGS
+      // HIDE BUILDINGS
       layers.forEach(layer => {
           if (layer.id.includes('building')) {
             map.setLayoutProperty(layer.id, 'visibility', 'none');
           }
       });
 
-      // 2. FIND INSERTION POINT
+      // FIND INSERTION POINT
       let insertionLayerId;
       for (const layer of layers) {
         if (layer.id.includes('water') && layer.type === 'fill') {
@@ -276,20 +431,11 @@
           break; 
         }
       }
-      if (!insertionLayerId) {
-         for (const layer of layers) {
-            if (layer.id.includes('road') || layer.type === 'symbol') {
-                insertionLayerId = layer.id;
-                break;
-            }
-         }
-      }
 
-      // 3. DYNAMIC WATER DETECTION (For Rescue Layer)
+      // DYNAMIC WATER DETECTION
       let waterSource = null;
       let waterSourceLayer = null;
       let waterColor = '#e0e0e0'; 
-      
       const waterRef = layers.find(l => l.id.includes('water') && l.type === 'fill');
       if (waterRef) {
           waterSource = waterRef.source;
@@ -301,8 +447,7 @@
           }
       }
 
-      // 4. ADD DATA LAYERS (Bottom Stack)
-      
+      // ADD DATA LAYERS
       map.addSource('pluto-data', { type: 'vector', url: LANDUSE_TILESET_ID });
       map.addLayer({
         'id': 'pluto-fill', 'type': 'fill', 'source': 'pluto-data', 'source-layer': LANDUSE_SOURCE_LAYER, 'minzoom': 10,
@@ -319,7 +464,7 @@
         },
         'layout': { 'visibility': 'visible' }
       }, insertionLayerId);
-
+      
       map.addLayer({
         'id': 'pluto-lines', 'type': 'line', 'source': 'pluto-data', 'source-layer': LANDUSE_SOURCE_LAYER,
         'paint': { 'line-width': 0.5, 'line-opacity': ['interpolate', ['linear'], ['zoom'], 11, 0, 13, 0.6], 'line-color': '#cccccc' },
@@ -337,7 +482,7 @@
         'layout': { 'visibility': 'none' }
       }, insertionLayerId);
 
-      // 5. MASK A: BOTTOM
+      // MASK A: BOTTOM
       map.addSource('mask-source', { type: 'geojson', data: WORLD_MASK });
       map.addLayer({
         id: 'mask-layer-bottom', type: 'fill', source: 'mask-source',
@@ -345,14 +490,13 @@
         layout: { 'visibility': 'visible' }
       }, insertionLayerId);
 
-      // 6. TRANSIT LAYERS (TOP STACK)
+      // TRANSIT LAYERS (TOP STACK)
       map.addSource('transit-source', { type: 'vector', url: TRANSIT_TILESET_ID });
-
       map.addLayer({
         id: 'transit-bus-lines', type: 'line', source: 'transit-source', 'source-layer': 'bus_routes',
         paint: { 'line-color': '#0245ef', 'line-width': 1, 'line-opacity': 0.8 },
         layout: { 'visibility': 'none' }
-      }); // Top
+      });
       map.addLayer({
         id: 'transit-bus-stops', type: 'circle', source: 'transit-source', 'source-layer': 'bus_stops',
         paint: { 'circle-color': '#0245ef', 'circle-radius': ['interpolate', ['linear'], ['zoom'], 12, 1, 15, 2.5], 'circle-opacity': 0.6 },
@@ -363,17 +507,20 @@
         paint: { 'line-width': 2.5, 'line-color': '#ffd73e' },
         layout: { 'visibility': 'none' }
       });
+      
       ['rail_lirr', 'rail_mnr', 'rail_njt', 'rail_amtrak', 'rail_path'].forEach(agency => {
           map.addLayer({
             id: `transit-rail-lines-${agency}_routes`, type: 'line', source: 'transit-source', 'source-layer': `${agency}_routes`,
             paint: { 'line-color': '#ff98ab', 'line-width': 1.5 }, layout: { 'visibility': 'none' }
           });
       });
+
       map.addLayer({
         id: 'transit-subway-stations', type: 'circle', source: 'transit-source', 'source-layer': 'subway_stations',
         paint: { 'circle-radius': 3.5, 'circle-color': '#ffffff', 'circle-stroke-width': 2, 'circle-stroke-color': '#ffd73e' },
         layout: { 'visibility': 'none' }
       });
+
       ['rail_lirr', 'rail_mnr', 'rail_njt', 'rail_amtrak', 'rail_path'].forEach(agency => {
           map.addLayer({
             id: `transit-rail-stations-${agency}_stops`, type: 'circle', source: 'transit-source', 'source-layer': `${agency}_stops`,
@@ -381,29 +528,23 @@
           });
       });
 
-      // 7. MASK B: TOP
+      // MASK B: TOP
       map.addLayer({
         id: 'mask-layer-top', type: 'fill', source: 'mask-source',
         paint: { 'fill-color': '#ffffff', 'fill-opacity': 0.85 },
         layout: { 'visibility': 'none' } 
       });
 
-      // 8. WATER RESCUE OVERLAY (Topmost)
+      // WATER RESCUE OVERLAY
       if (waterSource && waterSourceLayer) {
         map.addLayer({
-            'id': 'water-rescue',
-            'type': 'fill',
-            'source': waterSource,
-            'source-layer': waterSourceLayer,
-            'paint': {
-                'fill-color': waterColor,
-                'fill-opacity': 1
-            },
+            'id': 'water-rescue', 'type': 'fill', 'source': waterSource, 'source-layer': waterSourceLayer,
+            'paint': { 'fill-color': waterColor, 'fill-opacity': 1 },
             'layout': { 'visibility': 'none' } 
         });
       }
 
-      // 9. LENS OUTLINE (Topmost)
+      // LENS OUTLINE
       map.addSource('lens-source', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addLayer({
         id: 'lens-outline', type: 'line', source: 'lens-source',
