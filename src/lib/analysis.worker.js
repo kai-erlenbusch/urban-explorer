@@ -37,11 +37,20 @@ self.onmessage = async (e) => {
     }
 };
 
+// --- OPTIMIZATION HELPER ---
+// Pre-calculates BBox for every feature to speed up runtime analysis
+function precalcBBoxes(fc) {
+    if (!fc || !fc.features) return;
+    for (const f of fc.features) {
+        if (!f.bbox) f.bbox = turf.bbox(f);
+    }
+}
+
 // --- DATA LOADER ---
 async function loadData() {
     try {
         const responses = await Promise.all([
-            fetch('/data/census_dots_full.geojson').then(r => r.json()), // The correct FULL file
+            fetch('/data/census_dots_full.geojson').then(r => r.json()),
             fetch('/data/subway_stations.geojson').then(r => r.json()),
             fetch('/data/subway_lines.geojson').then(r => r.json()),
             fetch('/data/bus_stops.geojson').then(r => r.json()),
@@ -60,18 +69,29 @@ async function loadData() {
         ]);
 
         rawCensusData = responses[0];
+        
         rawTransitData.subwayStations = responses[1];
         rawTransitData.subwayLines = responses[2];
+        precalcBBoxes(rawTransitData.subwayLines); // Optimization
+
         rawTransitData.busStops = responses[3];
         rawTransitData.busLines = responses[4];
+        precalcBBoxes(rawTransitData.busLines); // Optimization
         
         rawTransitData.rail.lirr = { stops: responses[5], routes: responses[6] };
         rawTransitData.rail.mnr = { stops: responses[7], routes: responses[8] };
         rawTransitData.rail.njt = { stops: responses[9], routes: responses[10] };
         rawTransitData.rail.amtrak = { stops: responses[11], routes: responses[12] };
         rawTransitData.rail.path = { stops: responses[13], routes: responses[14] };
+
+        // Optimize all rail routes
+        precalcBBoxes(rawTransitData.rail.lirr.routes);
+        precalcBBoxes(rawTransitData.rail.mnr.routes);
+        precalcBBoxes(rawTransitData.rail.njt.routes);
+        precalcBBoxes(rawTransitData.rail.amtrak.routes);
+        precalcBBoxes(rawTransitData.rail.path.routes);
         
-        console.log("Worker: Data loaded successfully.");
+        console.log("Worker: Data loaded & Optimized.");
     } catch (err) {
         console.error("Worker: Failed to load data", err);
     }
@@ -91,7 +111,6 @@ function analyzeDemographics(centerPoint, radius) {
     let femaleCount = 0; 
     let ageCounts = { '0-4': 0, '5-17': 0, '18-34': 0, '35-59': 0, '60+': 0 };
 
-    // Dynamic Key Detection
     const sampleProps = rawCensusData.features[0]?.properties || {};
     const keys = Object.keys(sampleProps);
     const keyEth = keys.find(k => k.toLowerCase() === 'ethnicity') || 'ethnicity';
@@ -122,7 +141,6 @@ function analyzeDemographics(centerPoint, radius) {
              if (isFemale) femaleCount += pop;
  
              let rawAge = props[keyAge];
-             // Normalization logic
              if (!ageCounts.hasOwnProperty(rawAge)) {
                  if (rawAge === 'Under 5') rawAge = '0-4';
                  else if (rawAge === '5 to 17' || rawAge === '5-17') rawAge = '5-17';
@@ -170,7 +188,10 @@ function analyzeTransit(centerPoint, radius) {
           if (!featureCollection) return found;
 
           for (const f of featureCollection.features) {
-              const fBbox = turf.bbox(f);
+              // Optimized: Use pre-calculated BBox
+              const fBbox = f.bbox; 
+              
+              // Only run expensive intersection if BBoxes overlap
               const overlap = !(bbox[0] > fBbox[2] || bbox[2] < fBbox[0] || bbox[1] > fBbox[3] || bbox[3] < fBbox[1]);
               
               if (overlap) {
