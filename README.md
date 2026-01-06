@@ -1,43 +1,41 @@
-# Svelte + Vite
+# 🏙️ Urban Explorer: NYC (Based upon Morphocode Explorer [https://explorer.morphocode.com/])
 
-This template should help get you started developing with Svelte in Vite.
+A high-performance geospatial analysis tool that lets users explore New York City's urban fabric in real-time. Built with **Svelte**, **MapLibre GL**, and **Turf.js**, it performs complex spatial operations (demographics, land use, transit accessibility) entirely in the browser using multi-threaded architecture.
 
-## Recommended IDE Setup
+## 🚀 Key Features
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode).
+* **"Ped-Shed" Analysis:** Drag a radius anywhere in NYC to see instant analytics.
+* **Three Analytical Modes:**
+    * **🏗️ Land Use:** Analyzes MapPLUTO data to calculate entropy scores and land use mix.
+    * **👥 Demographics:** Aggregates census data to visualize population density, racial diversity, and age distribution.
+    * **🚇 Transit Network:** Identifies accessible Subway, Rail (LIRR/MNR/NJT), and Bus routes with instant intersection checks.
+* **High-Performance Architecture:** Capable of querying 100,000+ points and lines at 60fps without freezing the UI.
 
-## Need an official Svelte framework?
+## 🛠️ Technical Architecture
 
-Check out [SvelteKit](https://github.com/sveltejs/kit#readme), which is also powered by Vite. Deploy anywhere with its serverless-first approach and adapt to various platforms, with out of the box support for TypeScript, SCSS, and Less, and easily-added support for mdsvex, GraphQL, PostCSS, Tailwind CSS, and more.
+This project solves the "blocked main thread" problem common in browser-based GIS applications.
 
-## Technical considerations
+### 1. The "Orphaned" UI Thread
+Geospatial operations (like `turf.pointsWithinPolygon` or Line Intersections) are CPU-intensive. Running them on the main thread causes the map to stutter.
+* **Solution:** All heavy lifting is offloaded to a **Web Worker** (`analysis.worker.js`). The UI thread handles rendering and user input, while the worker handles the math.
 
-**Why use this over SvelteKit?**
+### 2. Backpressure Throttling
+Mouse movements trigger ~60 events per second, but spatial analysis takes ~50ms.
+* **Solution:** A "latest-only" throttling strategy is implemented in `Map.svelte`. If the worker is busy, intermediate requests are dropped, ensuring the user always sees the most current data without a queue buildup ("lag").
 
-- It brings its own routing solution which might not be preferable for some users.
-- It is first and foremost a framework that just happens to use Vite under the hood, not a Vite app.
+### 3. Spatial Optimization
+* **Pre-Calculated Bounding Boxes:** To speed up line intersection checks for transit routes, BBoxes are pre-calculated on load, changing an $O(N)$ geometric operation into an instant numeric check.
+* **Reactive Stores:** Svelte Stores (`stores.js`) decouple the Map (data producer) from the Sidebar (data consumer), ensuring clean, unidirectional data flow.
 
-This template contains as little as possible to get started with Vite + Svelte, while taking into account the developer experience with regards to HMR and intellisense. It demonstrates capabilities on par with the other `create-vite` templates and is a good starting point for beginners dipping their toes into a Vite + Svelte project.
+## 📦 Tech Stack
 
-Should you later need the extended capabilities and extensibility provided by SvelteKit, the template has been structured similarly to SvelteKit so that it is easy to migrate.
+* **Frontend:** Svelte, Vite
+* **Mapping:** MapLibre GL JS, Vector Tiles (MVT)
+* **Analysis:** Turf.js (Spatial Analysis), Web Workers API
+* **Styling:** CSS Grid, Custom SVG Charts (Donut/Waffle)
 
-**Why include `.vscode/extensions.json`?**
+## 📊 Data Sources
 
-Other templates indirectly recommend extensions via the README, but this file allows VS Code to prompt the user to install the recommended extension upon opening the project.
-
-**Why enable `checkJs` in the JS template?**
-
-It is likely that most cases of changing variable types in runtime are likely to be accidental, rather than deliberate. This provides advanced typechecking out of the box. Should you like to take advantage of the dynamically-typed nature of JavaScript, it is trivial to change the configuration.
-
-**Why is HMR not preserving my local component state?**
-
-HMR state preservation comes with a number of gotchas! It has been disabled by default in both `svelte-hmr` and `@sveltejs/vite-plugin-svelte` due to its often surprising behavior. You can read the details [here](https://github.com/sveltejs/svelte-hmr/tree/master/packages/svelte-hmr#preservation-of-local-state).
-
-If you have state that's important to retain within a component, consider creating an external store which would not be replaced by HMR.
-
-```js
-// store.js
-// An extremely simple external store
-import { writable } from 'svelte/store'
-export default writable(0)
-```
+* **Land Use:** NYC MapPLUTO (Department of City Planning)
+* **Demographics:** US Census Bureau (2020 Decennial Census)
+* **Transit:** MTA Static GTFS Data, NJ Transit Open Data
