@@ -1,10 +1,8 @@
 <script>
-  console.log(">>> NEW MAP COMPONENT LOADED (COLOR SYNCED) <<<");
+  console.log(">>> HYBRID MAP COMPONENT LOADED <<<");
   
   import { onMount, onDestroy } from 'svelte';
   import { activeLayer, analysisData, demographicsData, transitData, radius } from './stores.js';
-  
-  // 1. IMPORT CONSTANTS
   import { LU_CATEGORIES } from './constants.js';
 
   import maplibregl from 'maplibre-gl';
@@ -75,7 +73,7 @@
     if (map.getLayer('mask-layer-top')) map.setLayoutProperty('mask-layer-top', 'visibility', isTransit ? 'visible' : 'none');
     if (map.getLayer('mask-layer-bottom')) map.setLayoutProperty('mask-layer-bottom', 'visibility', isTransit ? 'none' : 'visible');
     if (map.getLayer('water-rescue')) map.setLayoutProperty('water-rescue', 'visibility', isTransit ? 'visible' : 'none');
-
+    
     if (cursorPosition) triggerUpdate(cursorPosition);
   });
 
@@ -96,7 +94,7 @@
 
     const centerPoint = turf.point([lngLat.lng, lngLat.lat]);
     const circleGeo = turf.circle(centerPoint, currentRadius, { steps: 64, units: 'miles' });
-
+    
     // 1. UPDATE VISUALS (Always runs 60fps)
     if (map.getSource('mask-source')) {
         let maskBase = MANHATTAN_MASK || WORLD_MASK;
@@ -109,17 +107,18 @@
         map.getSource('lens-source').setData(circleGeo);
     }
 
-    // 2. RUN ANALYSIS (Throttled via "Backpressure" check)
+    // 2. RUN ANALYSIS (HYBRID APPROACH)
+    // If Land Use, run on MAIN THREAD (restored logic)
     if (currentMode === 'landuse') {
-        analyzeLandUse(circleGeo);
+        analyzeLandUseMainThread(circleGeo);
     } 
+    // If Transit/Demographics, run in WORKER (optimized logic)
     else if (worker) {
         const payload = {
             centerPoint: [lngLat.lng, lngLat.lat],
             radius: currentRadius,
             mode: currentMode
         };
-
         if (!isWorkerBusy) {
             isWorkerBusy = true;
             worker.postMessage({ type: 'ANALYZE', payload });
@@ -129,23 +128,29 @@
     }
   }
 
-  // --- MAIN THREAD ANALYSIS ---
-  function analyzeLandUse(circleGeo) {
+  // --- RESTORED MAIN THREAD ANALYSIS FOR LAND USE ---
+  function analyzeLandUseMainThread(circleGeo) {
     if (!map) return;
     const bbox = turf.bbox(circleGeo);
     const southWest = map.project([bbox[0], bbox[1]]);
     const northEast = map.project([bbox[2], bbox[3]]);
     
+    // Query visible features (view-dependent)
     const features = map.queryRenderedFeatures([southWest, northEast], { layers: ['pluto-fill'] });
-    let totalArea = 0; let counts = {}; const seenIds = new Set();
+    
+    let totalArea = 0; 
+    let counts = {};
+    const seenIds = new Set();
     
     features.forEach(f => {
         const uniqueId = f.id || f.properties.BBL || f.properties.LotArea;
         if (seenIds.has(uniqueId)) return;
+        
         if (turf.booleanIntersects(f, circleGeo)) {
             seenIds.add(uniqueId);
             const rawLU = f.properties.LandUse; 
             const area = (f.properties.LotArea || turf.area(f)) * 0.000247105; 
+         
             if (rawLU) {
                 const cleanKey = parseInt(String(rawLU), 10).toString();
                 if (cleanKey && cleanKey !== "NaN") {
@@ -184,8 +189,11 @@
         if (pendingWorkerRequest) {
             const nextPayload = pendingWorkerRequest;
             pendingWorkerRequest = null;
-            isWorkerBusy = true;
-            worker.postMessage({ type: 'ANALYZE', payload: nextPayload });
+            // Only re-trigger worker if next request is NOT landuse (since landuse is now main thread)
+            if (nextPayload.mode !== 'landuse') {
+                 isWorkerBusy = true;
+                 worker.postMessage({ type: 'ANALYZE', payload: nextPayload });
+            }
         }
     };
 
@@ -237,26 +245,21 @@
       const landUseColorExpression = ['match', ['to-string', ['get', 'LandUse']]];
       LU_CATEGORIES.forEach(cat => {
           landUseColorExpression.push(cat.code, cat.color);
-          // Handle leading zeros (e.g. '01' vs '1') just in case
-          if (cat.code.length === 1) {
-              landUseColorExpression.push(`0${cat.code}`, cat.color);
-          } else if (cat.code.startsWith('0')) {
-               landUseColorExpression.push(cat.code.substring(1), cat.color);
-          }
+          if (cat.code.length === 1) landUseColorExpression.push(`0${cat.code}`, cat.color);
+          else if (cat.code.startsWith('0')) landUseColorExpression.push(cat.code.substring(1), cat.color);
       });
-      landUseColorExpression.push('#cccccc'); // Fallback color
+      landUseColorExpression.push('#cccccc'); 
 
       // ADD DATA LAYERS
       map.addSource('pluto-data', { type: 'vector', url: LANDUSE_TILESET_ID });
       map.addLayer({
         'id': 'pluto-fill', 'type': 'fill', 'source': 'pluto-data', 'source-layer': LANDUSE_SOURCE_LAYER, 'minzoom': 10,
         'paint': { 
-            'fill-color': landUseColorExpression, // <--- NOW USING DYNAMIC EXPRESSION
+            'fill-color': landUseColorExpression, 
             'fill-opacity': 1 
         },
         'layout': { 'visibility': 'visible' }
       }, insertionLayerId);
-
       map.addLayer({
         'id': 'pluto-lines', 'type': 'line', 'source': 'pluto-data', 'source-layer': LANDUSE_SOURCE_LAYER,
         'paint': { 'line-width': 0.5, 'line-opacity': ['interpolate', ['linear'], ['zoom'], 11, 0, 13, 0.6], 'line-color': '#cccccc' },
@@ -297,20 +300,17 @@
         paint: { 'line-width': 2.5, 'line-color': '#ffd73e' },
         layout: { 'visibility': 'none' }
       });
-
       ['rail_lirr', 'rail_mnr', 'rail_njt', 'rail_amtrak', 'rail_path'].forEach(agency => {
           map.addLayer({
             id: `transit-rail-lines-${agency}_routes`, type: 'line', source: 'transit-source', 'source-layer': `${agency}_routes`,
             paint: { 'line-color': '#ff98ab', 'line-width': 1.5 }, layout: { 'visibility': 'none' }
           });
       });
-
       map.addLayer({
         id: 'transit-subway-stations', type: 'circle', source: 'transit-source', 'source-layer': 'subway_stations',
         paint: { 'circle-radius': 3.5, 'circle-color': '#ffffff', 'circle-stroke-width': 2, 'circle-stroke-color': '#ffd73e' },
         layout: { 'visibility': 'none' }
       });
-
       ['rail_lirr', 'rail_mnr', 'rail_njt', 'rail_amtrak', 'rail_path'].forEach(agency => {
           map.addLayer({
             id: `transit-rail-stations-${agency}_stops`, type: 'circle', source: 'transit-source', 'source-layer': `${agency}_stops`,
@@ -337,7 +337,6 @@
         id: 'lens-outline', type: 'line', source: 'lens-source',
         paint: { 'line-color': '#333333', 'line-width': 1.5, 'line-dasharray': [2, 3] }
       });
-
       map.on('mousemove', (e) => triggerUpdate(e.lngLat));
       updateMapState(map.getCenter());
     });

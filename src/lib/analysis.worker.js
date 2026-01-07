@@ -1,6 +1,7 @@
 import * as turf from '@turf/turf';
 
 let rawCensusData = null;
+let rawLandUseData = null; // <--- NEW: Store for Land Use Data
 let rawTransitData = {
     subwayStations: null,
     subwayLines: null,
@@ -33,12 +34,15 @@ self.onmessage = async (e) => {
         } else if (mode === 'transit') {
             const results = analyzeTransit(centerPoint, radius);
             self.postMessage({ type: 'RESULTS_TRANSIT', data: results });
+        } else if (mode === 'landuse') {
+            // <--- NEW: Handle Land Use mode in worker
+            const results = analyzeLandUse(centerPoint, radius);
+            self.postMessage({ type: 'RESULTS_LANDUSE', data: results });
         }
     }
 };
 
 // --- OPTIMIZATION HELPER ---
-// Pre-calculates BBox for every feature to speed up runtime analysis
 function precalcBBoxes(fc) {
     if (!fc || !fc.features) return;
     for (const f of fc.features) {
@@ -66,17 +70,24 @@ async function loadData() {
             fetch('/data/rail_amtrak_routes.geojson').then(r => r.json()),
             fetch('/data/rail_path_stops.geojson').then(r => r.json()),
             fetch('/data/rail_path_routes.geojson').then(r => r.json()),
+            
+            // <--- NEW: Fetch Land Use Data
+            // NOTE: Ensure you export your PLUTO data to this location!
+            fetch('/data/landuse_full.geojson').then(r => r.json()).catch(e => {
+                console.warn("Land use data missing or failed to load");
+                return null;
+            }), 
         ]);
 
         rawCensusData = responses[0];
         
         rawTransitData.subwayStations = responses[1];
         rawTransitData.subwayLines = responses[2];
-        precalcBBoxes(rawTransitData.subwayLines); // Optimization
+        precalcBBoxes(rawTransitData.subwayLines); 
 
         rawTransitData.busStops = responses[3];
         rawTransitData.busLines = responses[4];
-        precalcBBoxes(rawTransitData.busLines); // Optimization
+        precalcBBoxes(rawTransitData.busLines); 
         
         rawTransitData.rail.lirr = { stops: responses[5], routes: responses[6] };
         rawTransitData.rail.mnr = { stops: responses[7], routes: responses[8] };
@@ -84,13 +95,16 @@ async function loadData() {
         rawTransitData.rail.amtrak = { stops: responses[11], routes: responses[12] };
         rawTransitData.rail.path = { stops: responses[13], routes: responses[14] };
 
-        // Optimize all rail routes
+        // Optimize rail routes
         precalcBBoxes(rawTransitData.rail.lirr.routes);
         precalcBBoxes(rawTransitData.rail.mnr.routes);
         precalcBBoxes(rawTransitData.rail.njt.routes);
         precalcBBoxes(rawTransitData.rail.amtrak.routes);
         precalcBBoxes(rawTransitData.rail.path.routes);
         
+        rawLandUseData = responses[15]; 
+        if (rawLandUseData) precalcBBoxes(rawLandUseData); // Optimize polygons
+
         console.log("Worker: Data loaded & Optimized.");
     } catch (err) {
         console.error("Worker: Failed to load data", err);
@@ -98,6 +112,61 @@ async function loadData() {
 }
 
 // --- ANALYSIS FUNCTIONS ---
+
+function analyzeLandUse(centerPoint, radius) {
+    if (!rawLandUseData) return { count: 0, area: 0, breakdown: {}, entropy: 0 };
+
+    const circleGeo = turf.circle(centerPoint, radius, { steps: 64, units: 'miles' });
+    const bbox = turf.bbox(circleGeo);
+    
+    let totalArea = 0; 
+    let counts = {};
+    const seenIds = new Set();
+    let featureCount = 0;
+
+    for (const f of rawLandUseData.features) {
+        // 1. Fast BBox check (using precalculated bbox if available)
+        const fBbox = f.bbox || turf.bbox(f);
+        // If the feature is completely outside the analysis window, skip it
+        if (bbox[0] > fBbox[2] || bbox[2] < fBbox[0] || bbox[1] > fBbox[3] || bbox[3] < fBbox[1]) continue;
+
+        // 2. Precise Intersection check
+        if (turf.booleanIntersects(f, circleGeo)) {
+            // Identifier check
+            const uniqueId = f.id || f.properties.BBL || f.properties.LotArea;
+            if (seenIds.has(uniqueId)) continue;
+            seenIds.add(uniqueId);
+            featureCount++;
+
+            const rawLU = f.properties.LandUse; 
+            // Calculate area (Square Meters to Acres)
+            const area = (f.properties.LotArea || turf.area(f)) * 0.000247105; 
+
+            if (rawLU) {
+                // Normalize keys (handle "01" vs "1")
+                const cleanKey = parseInt(String(rawLU), 10).toString();
+                if (cleanKey && cleanKey !== "NaN") {
+                    if (!counts[cleanKey]) counts[cleanKey] = 0; 
+                    counts[cleanKey] += area; 
+                    totalArea += area;
+                }
+            }
+        }
+    }
+
+    // 3. Calculate Entropy
+    let entropy = 0;
+    if (totalArea > 0) {
+        let H = 0;
+        Object.values(counts).forEach(a => { 
+            const p = a / totalArea; 
+            if (p > 0) H -= p * Math.log(p); 
+        });
+        entropy = H / Math.log(11); 
+    }
+
+    return { count: featureCount, area: totalArea, breakdown: counts, entropy };
+}
 
 function analyzeDemographics(centerPoint, radius) {
     if (!rawCensusData) return null;
@@ -188,10 +257,7 @@ function analyzeTransit(centerPoint, radius) {
           if (!featureCollection) return found;
 
           for (const f of featureCollection.features) {
-              // Optimized: Use pre-calculated BBox
               const fBbox = f.bbox; 
-              
-              // Only run expensive intersection if BBoxes overlap
               const overlap = !(bbox[0] > fBbox[2] || bbox[2] < fBbox[0] || bbox[1] > fBbox[3] || bbox[3] < fBbox[1]);
               
               if (overlap) {
